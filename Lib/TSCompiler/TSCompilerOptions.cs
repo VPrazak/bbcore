@@ -2,6 +2,7 @@
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
+using Newtonsoft.Json.Serialization;
 
 namespace Lib.TSCompiler
 {
@@ -81,11 +82,19 @@ namespace Lib.TSCompiler
             return jToken.ToObject<TSCompilerOptions>();
         }
 
-        static public JsonSerializerSettings GetSerializerSettings()
+        static readonly JsonSerializerSettings _cachedSerializerSettings;
+
+        static TSCompilerOptions()
         {
             var res = new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore };
-            res.Converters.Add(new Newtonsoft.Json.Converters.StringEnumConverter(true));
-            return res;
+            res.Converters.Add(
+                new Newtonsoft.Json.Converters.StringEnumConverter(new CamelCaseNamingStrategy(true, false), false));
+            _cachedSerializerSettings = res;
+        }
+
+        static public JsonSerializerSettings GetSerializerSettings()
+        {
+            return _cachedSerializerSettings;
         }
 
         public ITSCompilerOptions Clone()
@@ -162,8 +171,9 @@ namespace Lib.TSCompiler
             };
         }
 
-        public TSCompilerOptions Merge(TSCompilerOptions with)
+        public ITSCompilerOptions Merge(ITSCompilerOptions withInterface)
         {
+            var with = (TSCompilerOptions)withInterface;
             if (with == null)
                 return this;
             if (with.allowJs != null)

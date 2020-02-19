@@ -4,17 +4,6 @@ using Lib.Utils;
 
 namespace Lib.Watcher
 {
-    public class DummyWatcher : IDirectoryWatcher
-    {
-        public void Dispose()
-        {
-        }
-
-        public string WatchedDirectory { get; set; }
-        public Action<string> OnFileChange { get; set; }
-        public Action OnError { get; set; }
-    }
-
     public class OsWatcher : IDirectoryWatcher
     {
         public string WatchedDirectory
@@ -82,7 +71,7 @@ namespace Lib.Watcher
                 try
                 {
                     _fileSystemWatcher = new FileSystemWatcher(WatchedDirectory);
-                    _fileSystemWatcher.IncludeSubdirectories = false;
+                    _fileSystemWatcher.IncludeSubdirectories = true;
                     _fileSystemWatcher.Created += WatcherChangeHandler;
                     _fileSystemWatcher.Deleted += WatcherChangeHandler;
                     _fileSystemWatcher.Changed += WatcherChangeHandler;
@@ -102,8 +91,7 @@ namespace Lib.Watcher
             lock (_createLock)
             {
                 _disposed = true;
-                if (_fileSystemWatcher != null)
-                    _fileSystemWatcher.Dispose();
+                _fileSystemWatcher?.Dispose();
             }
         }
     }

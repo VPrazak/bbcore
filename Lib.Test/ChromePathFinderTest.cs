@@ -9,9 +9,9 @@ namespace Lib.Test
 {
     class FakeFs : IFsAbstraction
     {
-        private bool _isUnix;
-        private bool _isMac;
-        private string _chromPath;
+        bool _isUnix;
+        bool _isMac;
+        string _chromPath;
         public FakeFs(bool isUnix, string chromePath = null, bool isMac = false)
         {
             _isUnix = isUnix;
@@ -36,7 +36,7 @@ namespace Lib.Test
             throw new NotImplementedException();
         }
 
-        public FsItemInfo GetItemInfo(string path)
+        public FsItemInfo GetItemInfo(ReadOnlySpan<char> path)
         {
             throw new NotImplementedException();
         }

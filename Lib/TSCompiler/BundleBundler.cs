@@ -3,14 +3,19 @@ using Lib.Utils;
 using Lib.ToolsDir;
 using Lib.Bundler;
 using System.Linq;
-using System.IO;
 using Lib.CSSProcessor;
-using Lib.DiskCache;
 using System.Globalization;
+using BTDB.Collections;
+using System;
+using System.Text.RegularExpressions;
+using Njsast.Ast;
+using Njsast.Bundler;
+using Njsast.SourceMap;
+using BundlerImpl = Lib.Bundler.BundlerImpl;
 
 namespace Lib.TSCompiler
 {
-    public class BundleBundler : IBundlerCallback
+    public class BundleBundler : IBundlerCallback, IBundler
     {
         string _mainJsBundleUrl;
         string _bundlePng;
@@ -18,78 +23,71 @@ namespace Lib.TSCompiler
         string _indexHtml;
         readonly IToolsDir _tools;
 
-        public BundleBundler(IToolsDir tools)
+        public BundleBundler(IToolsDir tools, MainBuildResult mainBuildResult, ProjectOptions project, BuildResult buildResult)
         {
             _tools = tools;
+            _mainBuildResult = mainBuildResult;
+            _project = project;
+            _buildResult = buildResult;
         }
 
-        public ProjectOptions Project;
-        public BuildResult BuildResult;
+        readonly ProjectOptions _project;
+        readonly BuildResult _buildResult;
+        readonly MainBuildResult _mainBuildResult;
+        RefDictionary<string, BundleBundler>? _subBundlers;
 
-        // value could be string or byte[] or Lazy<string|byte[]>
-        public Dictionary<string, object> FilesContent;
-        Dictionary<string, string> _jsFilesContent;
-
-        public void Build(bool compress, bool mangle, bool beautify)
+        public void Build(bool compress, bool mangle, bool beautify, bool _, string? __)
         {
-            var diskCache = Project.Owner.DiskCache;
-            var root = Project.Owner.Owner.FullPath;
-            _jsFilesContent = new Dictionary<string, string>();
             var cssLink = "";
             var cssToBundle = new List<SourceFromPair>();
-            foreach (var source in BuildResult.Path2FileInfo)
+            foreach (var source in _buildResult.Path2FileInfo.Values.OrderBy(f => f.Owner.FullPath).ToArray())
             {
-                if (source.Value.Type == FileCompilationType.TypeScript ||
-                    source.Value.Type == FileCompilationType.JavaScript ||
-                    source.Value.Type == FileCompilationType.JavaScriptAsset)
+                if (source.Type == FileCompilationType.Css || source.Type == FileCompilationType.ImportedCss)
                 {
-                    if (source.Value.Output == null)
-                        continue; // Skip d.ts
-                    _jsFilesContent[PathUtils.ChangeExtension(source.Key, "js").ToLowerInvariant()] =
-                        source.Value.Output;
+                    cssToBundle.Add(new SourceFromPair(source.Owner.Utf8Content, source.Owner.FullPath));
                 }
-                else if (source.Value.Type == FileCompilationType.Json)
+                else if (source.Type == FileCompilationType.Resource)
                 {
-                    _jsFilesContent[source.Key.ToLowerInvariant() + ".js"] =
-                        "Object.assign(module.exports, " + source.Value.Owner.Utf8Content + ");";
-                }
-                else if (source.Value.Type == FileCompilationType.Css)
-                {
-                    cssToBundle.Add(new SourceFromPair(source.Value.Owner.Utf8Content, source.Value.Owner.FullPath));
-                }
-                else if (source.Value.Type == FileCompilationType.Resource)
-                {
-                    FilesContent[source.Value.OutputUrl] = source.Value.Owner.ByteContent;
+                    _mainBuildResult.FilesContent.GetOrAddValueRef(_buildResult.ToOutputUrl(source)) = source.Owner.ByteContent;
                 }
             }
 
             if (cssToBundle.Count > 0)
             {
-                string cssPath = Project.AllocateName("bundle.css");
-                var cssProcessor = new CssProcessor(Project.Tools);
-                FilesContent[cssPath] = cssProcessor.ConcatenateAndMinifyCss(cssToBundle, (string url, string from) =>
+                string cssPath = _mainBuildResult.AllocateName("bundle.css");
+                var cssProcessor = new CssProcessor(_project.Tools);
+                var cssContent = cssProcessor.ConcatenateAndMinifyCss(cssToBundle, (string url, string from) =>
                 {
                     var full = PathUtils.Join(from, url);
                     var fullJustName = full.Split('?', '#')[0];
-                    var fileAdditionalInfo = BuildModuleCtx.AutodetectAndAddDependencyCore(Project, fullJustName,
-                        diskCache.TryGetItem(from) as IFileCache);
-                    FilesContent[fileAdditionalInfo.OutputUrl] = fileAdditionalInfo.Owner.ByteContent;
-                    return PathUtils.SplitDirAndFile(fileAdditionalInfo.OutputUrl).Item2 +
+                    _buildResult.Path2FileInfo.TryGetValue(fullJustName, out var fileAdditionalInfo);
+                    _mainBuildResult.FilesContent.GetOrAddValueRef(_buildResult.ToOutputUrl(fileAdditionalInfo)) =
+                        fileAdditionalInfo.Owner.ByteContent;
+                    return PathUtils.GetFile(fileAdditionalInfo.OutputUrl) +
                            full.Substring(fullJustName.Length);
                 }).Result;
+                var cssImports = "";
+                foreach (var match in Regex.Matches(cssContent, "@import .*;"))
+                {
+                    cssImports += match.ToString();
+                    cssContent = cssContent.Replace(match.ToString(), "");
+                }
+
+                _mainBuildResult.FilesContent.GetOrAddValueRef(cssPath) = cssImports + cssContent;
                 cssLink += "<link rel=\"stylesheet\" href=\"" + cssPath + "\">";
             }
 
-            if (Project.SpriteGeneration)
+            if (_project.SpriteGeneration)
             {
-                _bundlePng = Project.BundlePngUrl;
-                var bundlePngContent = Project.SpriteGenerator.BuildImage(true);
+                _bundlePng = _project.BundlePngUrl;
+                var bundlePngContent = _project.SpriteGenerator.BuildImage(true);
                 if (bundlePngContent != null)
                 {
                     _bundlePngInfo = new List<float>();
                     foreach (var slice in bundlePngContent)
                     {
-                        FilesContent[PathUtils.InjectQuality(_bundlePng, slice.Quality)] = slice.Content;
+                        _mainBuildResult.FilesContent.GetOrAddValueRef(PathUtils.InjectQuality(_bundlePng, slice.Quality)) =
+                            slice.Content;
                         _bundlePngInfo.Add(slice.Quality);
                     }
                 }
@@ -101,53 +99,68 @@ namespace Lib.TSCompiler
 
             var bundler = new BundlerImpl(_tools);
             bundler.Callbacks = this;
-            if (Project.ExampleSources.Count > 0)
+            if ((_project.ExampleSources?.Count ?? 0) > 0)
             {
-                bundler.MainFiles = new[] {PathUtils.ChangeExtension(Project.ExampleSources[0], "js")};
+                bundler.MainFiles = new[] {_project.ExampleSources[0]};
             }
             else
             {
-                bundler.MainFiles = new[] {PathUtils.ChangeExtension(Project.MainFile, "js")};
+                bundler.MainFiles = new[] {_project.MainFile};
             }
 
-            _mainJsBundleUrl = Project.BundleJsUrl;
+            _mainJsBundleUrl = _buildResult.BundleJsUrl;
             bundler.Compress = compress;
             bundler.Mangle = mangle;
             bundler.Beautify = beautify;
-            var defines = new Dictionary<string, object>();
-            foreach (var p in Project.Defines)
-            {
-                defines.Add(p.Key, p.Value);
-            }
-
-            bundler.Defines = defines;
+            bundler.Defines = _project.BuildDefines(_mainBuildResult);
             bundler.Bundle();
-            if (!Project.NoHtml)
+            if (!_project.NoHtml)
             {
                 BuildFastBundlerIndexHtml(cssLink);
-                FilesContent["index.html"] = _indexHtml;
+                _mainBuildResult.FilesContent.GetOrAddValueRef("index.html") = _indexHtml;
+            }
+
+            if (_project.SubProjects != null)
+            {
+                var newSubBundlers = new RefDictionary<string, BundleBundler>();
+                foreach (var (projPath, subProject) in _project.SubProjects.OrderBy(a=>a.Value!.Variant=="serviceworker"))
+                {
+                    if (_subBundlers == null || !_subBundlers.TryGetValue(projPath, out var subBundler))
+                    {
+                        subBundler = new BundleBundler(_tools, _mainBuildResult, subProject, _buildResult.SubBuildResults.GetOrFakeValueRef(projPath));
+                    }
+
+                    newSubBundlers.GetOrAddValueRef(projPath) = subBundler;
+                    subBundler.Build(compress, mangle, beautify, false, null);
+                }
+
+                _subBundlers = newSubBundlers;
+            }
+            else
+            {
+                _subBundlers = null;
             }
         }
 
         void BuildFastBundlerIndexHtml(string cssLink)
         {
             _indexHtml =
-                $@"<!DOCTYPE html><html><head><meta charset=""utf-8"">{Project.HtmlHeadExpanded}<title>{Project.Title}</title>{cssLink}</head><body>{InitG11n()}<script src=""{_mainJsBundleUrl}"" charset=""utf-8""></script></body></html>";
+                $@"<!DOCTYPE html><html><head><meta charset=""utf-8"">{_project.ExpandHtmlHead(_buildResult)}<title>{_project.Title}</title>{cssLink}</head><body><script src=""{_mainJsBundleUrl}"" charset=""utf-8""></script></body></html>";
         }
 
         string InitG11n()
         {
-            if (!Project.Localize && _bundlePng == null)
+            if (!_project.Localize && _bundlePng == null)
                 return "";
-            var res = "<script>";
-            if (Project.Localize)
+            var res = "";
+            if (_project.Localize)
             {
-                Project.TranslationDb.BuildTranslationJs(_tools, FilesContent, Project.OutputSubDir);
+                _project.TranslationDb.BuildTranslationJs(_tools, _mainBuildResult.FilesContent, _mainBuildResult.OutputSubDir);
                 res +=
-                    $"function g11nPath(s){{return\"./{(Project.OutputSubDir != null ? (Project.OutputSubDir + "/") : "")}\"+s.toLowerCase()+\".js\"}};";
-                if (Project.DefaultLanguage != null)
+                    $"function g11nPath(s){{return\"./{(_mainBuildResult.OutputSubDir != null ? (_mainBuildResult.OutputSubDir + "/") : "")}\"+s.toLowerCase()+\".js\"}};";
+                if (_project.DefaultLanguage != null)
                 {
-                    res += $"var g11nLoc=\"{Project.DefaultLanguage}\";";
+                    res += $"var g11nLoc=\"{_project.DefaultLanguage}\";";
                 }
             }
 
@@ -169,70 +182,96 @@ namespace Lib.TSCompiler
                 }
             }
 
-            res += "</script>";
+            res += ";";
             return res;
         }
 
         public string ReadContent(string name)
         {
-            if (_jsFilesContent.TryGetValue(name.ToLowerInvariant(), out var content))
+            if (!_buildResult.Path2FileInfo.TryGetValue(name, out var fileInfo))
             {
-                return content;
+                throw new InvalidOperationException("Bundler ReadContent does not exists:" + name);
             }
 
-            throw new System.InvalidOperationException("Bundler Read Content does not exists:" + name);
+            if (fileInfo.Type == FileCompilationType.ImportedCss || fileInfo.Type == FileCompilationType.Css)
+                return "";
+            if (fileInfo.Type == FileCompilationType.Json)
+            {
+                return fileInfo.Owner.Utf8Content;
+            }
+
+            if (fileInfo.Type == FileCompilationType.JavaScriptAsset ||
+                fileInfo.Type == FileCompilationType.JavaScript || fileInfo.Type == FileCompilationType.EsmJavaScript)
+            {
+                return fileInfo.Output;
+            }
+
+            if (fileInfo.Type == FileCompilationType.TypeScriptDefinition)
+            {
+                return "";
+            }
+
+            if (fileInfo.Type == FileCompilationType.TypeScript)
+            {
+                var sourceMapBuilder = new SourceMapBuilder();
+                var adder = sourceMapBuilder.CreateSourceAdder(fileInfo.Output, fileInfo.MapLink);
+                var sourceReplacer = new SourceReplacer();
+                _project.ApplySourceInfo(sourceReplacer, fileInfo.SourceInfo, _buildResult);
+                sourceReplacer.Apply(adder);
+                return sourceMapBuilder.Content();
+            }
+
+            throw new InvalidOperationException("Bundler Read Content unknown type " +
+                                                Enum.GetName(typeof(FileCompilationType), fileInfo.Type) + ":" + name);
         }
 
         public void WriteBundle(string name, string content)
         {
-            FilesContent[name] = content;
+            if (name == _mainJsBundleUrl)
+                content = InitG11n() + content;
+            _mainBuildResult.FilesContent.GetOrAddValueRef(name) = content;
         }
 
         public string GenerateBundleName(string forName)
         {
             if (forName == "")
                 return _mainJsBundleUrl;
-            return Project.AllocateName(forName.Replace("/", "_") + ".js");
+            return _mainBuildResult.AllocateName(forName.Replace("/", "_") + ".js");
         }
 
         public string ResolveRequire(string name, string from)
         {
-            if (name.StartsWith("./") || name.StartsWith("../"))
+            if (!_buildResult.ResolveCache.TryGetValue((from, name), out var resolveResult))
             {
-                return PathUtils.Join(PathUtils.Parent(from), name) + ".js";
+                throw new Exception($"Bundler cannot resolve {name} from {from}");
             }
 
-            var diskCache = Project.Owner.DiskCache;
-            var moduleInfo = TSProject.FindInfoForModule(Project.Owner.Owner, diskCache, Project.Owner.Logger, name,
-                out var diskName);
-            if (moduleInfo == null)
-                return null;
-            var mainFile =
-                PathUtils.ChangeExtension(PathUtils.Join(moduleInfo.Owner.FullPath, moduleInfo.MainFile), "js");
-            return mainFile;
+            var res = resolveResult.FileNameWithPreference(false);
+            if (res == "?")
+            {
+                throw new Exception($"Bundler failed to resolve {name} from {from}");
+            }
+
+            return res;
         }
 
         public string TslibSource(bool withImport)
         {
-            return _tools.TsLibSource + (withImport ? _tools.ImportSource : "");
+            return BundlerHelpers.JsHeaders(withImport);
         }
 
         public IList<string> GetPlainJsDependencies(string name)
         {
-            var diskCache = Project.Owner.DiskCache;
-            var file = diskCache.TryGetItem(PathUtils.ChangeExtension(name, "ts")) as IFileCache;
-            if (file == null)
+            if (!_buildResult.Path2FileInfo.TryGetValue(name, out var fileInfo))
             {
-                file = diskCache.TryGetItem(PathUtils.ChangeExtension(name, "tsx")) as IFileCache;
+                throw new InvalidOperationException("Bundler GetPlainJsDependencies does not exists:" + name);
             }
 
-            if (file == null)
-                return new List<string>();
-            var fileInfo = TSFileAdditionalInfo.Get(file, diskCache);
             var sourceInfo = fileInfo.SourceInfo;
-            if (sourceInfo == null || sourceInfo.assets == null)
+            if (sourceInfo == null || sourceInfo.Assets == null)
                 return new List<string>();
-            return sourceInfo.assets.Select(i => i.name).Where(i => i.EndsWith(".js")).ToList();
+            return sourceInfo.Assets.Select(i => i.Name).Where(i => i != null && !i.StartsWith("resource:") && i.EndsWith(".js"))
+                .ToList()!;
         }
     }
 }

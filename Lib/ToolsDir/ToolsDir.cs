@@ -1,10 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
-using System.Text;
 using System.Threading.Tasks;
 using JavaScriptEngineSwitcher.Core;
 using Lib.Registry;
@@ -24,7 +22,6 @@ namespace Lib.ToolsDir
         public ToolsDir(string dir, ILogger logger)
         {
             _logger = logger;
-            _jasmineVersion = "299";
             lock (lockInitialization)
             {
                 Path = dir;
@@ -37,14 +34,14 @@ namespace Lib.ToolsDir
                     {
                         jsEngineSwitcher.EngineFactories.Add(
                             new JavaScriptEngineSwitcher.ChakraCore.ChakraCoreJsEngineFactory(
-                                new JavaScriptEngineSwitcher.ChakraCore.ChakraCoreSettings {MaxStackSize = 2000000}));
+                                new JavaScriptEngineSwitcher.ChakraCore.ChakraCoreSettings {MaxStackSize = 2000000, DisableFatalOnOOM = true}));
                         jsEngineSwitcher.DefaultEngineName =
                             JavaScriptEngineSwitcher.ChakraCore.ChakraCoreJsEngine.EngineName;
                     }
                 }
 
-                SetJasmineVersion("299");
-                LoaderJs = ResourceUtils.GetText("Lib.ToolsDir.loader.js");
+                SetJasmineVersion("330");
+                LoaderJs = ResourceUtils.GetText("Lib.ToolsDir.loader.js").Replace("\"use strict\";","");
                 JasmineCoreJs299 = ResourceUtils.GetText("Lib.ToolsDir.jasmine299.js");
                 JasmineDts299 = ResourceUtils.GetText("Lib.ToolsDir.jasmine299.d.ts");
                 JasmineDtsPath299 = PathUtils.Join(Path, "jasmine.d.ts");
@@ -61,8 +58,6 @@ namespace Lib.ToolsDir
                 WebtZip = ResourceUtils.GetZip("Lib.ToolsDir.webt.zip");
                 WebZip = ResourceUtils.GetZip("Lib.ToolsDir.web.zip");
                 _localeDefs = JObject.Parse(ResourceUtils.GetText("Lib.ToolsDir.localeDefs.json"));
-                TsLibSource = ResourceUtils.GetText("Lib.TSCompiler.tslib.js");
-                ImportSource = ResourceUtils.GetText("Lib.TSCompiler.import.js");
                 LiveReloadJs = ResourceUtils.GetText("Lib.ToolsDir.liveReload.js");
             }
         }
@@ -85,6 +80,10 @@ namespace Lib.ToolsDir
                 {
                     _typeScriptJsContent = File.ReadAllText(PathUtils.Join(TypeScriptLibDir, "typescript.js"));
 
+                    // Patch TS to generate d.ts also from node_modules directory (it makes much faster typecheck when changing something in node_modules)
+                    // function isSourceFileFromExternalLibrary must return always false!
+                    _typeScriptJsContent =
+                        _typeScriptJsContent.Replace("return !!sourceFilesFoundSearchingNodeModules.get(file.path);", "return false;");
                     // Patch TypeScript compiler to never generate useless __esmodule = true
                     _typeScriptJsContent =
                         _typeScriptJsContent.Replace("(shouldEmitUnderscoreUnderscoreESModule())", "(false)");
@@ -130,6 +129,9 @@ namespace Lib.ToolsDir
                         }
                     }
 
+                    // patch https://github.com/microsoft/TypeScript/issues/33142 in 3.6.2
+                    _typeScriptJsContent = _typeScriptJsContent.Replace("process.argv", "\"\"");
+
                     // Remove too defensive check for TS2742 - it is ok in Bobril-build to have relative paths into node_modules when in sandboxes
                     _typeScriptJsContent = _typeScriptJsContent.Replace(".indexOf(\"/node_modules/\") >= 0", "===null");
                 }
@@ -165,11 +167,7 @@ namespace Lib.ToolsDir
         readonly JObject _localeDefs;
         string _proxyWeb;
         string _proxyWebt;
-
-        public string TsLibSource { get; }
-
-        public string ImportSource { get; }
-
+        
         public string LiveReloadJs { get; }
 
         public async Task DownloadAndExtractTS(string dir, string versionString)
@@ -185,9 +183,9 @@ namespace Lib.ToolsDir
                 packageInfo.LazyParseVersions(v => v == version, reader =>
                 {
                     var j = PackageJson.Parse(reader);
-                    var tgzName = PathUtils.SplitDirAndFile(j.Dist.Tarball).Item2;
-                    _logger.Info($"Downloading Tarball {tgzName}");
-                    task = npmr.GetPackageTgz("typescript", tgzName);
+                    PathUtils.SplitDirAndFile(j.Dist.Tarball, out var tgzName);
+                    _logger.Info($"Downloading Tarball {tgzName.ToString()}");
+                    task = npmr.GetPackageTgz("typescript", tgzName.ToString());
                 });
             }
             catch (Exception)
@@ -207,7 +205,7 @@ namespace Lib.ToolsDir
                     if (name.StartsWith("package/"))
                         name = name.Substring("package/".Length);
                     var fn = PathUtils.Join(dir, name);
-                    Directory.CreateDirectory(PathUtils.Parent(fn));
+                    Directory.CreateDirectory(PathUtils.DirToCreateDirectory(PathUtils.Parent(fn)));
                     using (var targetStream = File.Create(fn))
                     {
                         var buf = new byte[4096];
@@ -231,7 +229,7 @@ namespace Lib.ToolsDir
 
         public void SetJasmineVersion(string version)
         {
-            _jasmineVersion = version ?? "299";
+            _jasmineVersion = version ?? "330";
         }
 
         public void SetTypeScriptVersion(string version)

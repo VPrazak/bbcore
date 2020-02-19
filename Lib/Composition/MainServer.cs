@@ -23,7 +23,9 @@ namespace Lib.Composition
             get => _project; internal set => _project = value;
         }
 
-        public string ProjectDir { get => _project.Owner.Owner.FullPath; }
+        public MainBuildResult MainBuildResult { get; set; }
+
+        public string ProjectDir { get => MainBuildResult.CommonSourceDirectory; }
 
         public Func<TestServerState> TestServerStateGetter => _testServerStateGetter;
 
@@ -50,7 +52,7 @@ namespace Lib.Composition
             SendToAll("compilationStarted", null);
         }
 
-        public void NotifyCompilationFinished(int errors, int warnings, double time, IList<CompilationResultMessage> messages)
+        public void NotifyCompilationFinished(int errors, int warnings, double time, IList<Diagnostic> messages)
         {
             SendToAll("compilationFinished", new Dictionary<string, object> {
                 { "errors", errors },
@@ -65,6 +67,13 @@ namespace Lib.Composition
             if (Clients.IsEmpty)
                 return;
             SendToAll("testUpdated", _testServerStateGetter());
+        }
+
+        public void NotifyCoverageChange()
+        {
+            if (Clients.IsEmpty)
+                return;
+            SendToAll("coverageUpdated", null);
         }
     }
 }

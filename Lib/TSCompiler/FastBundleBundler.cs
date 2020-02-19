@@ -4,100 +4,85 @@ using Lib.Utils;
 using Lib.ToolsDir;
 using System.Linq;
 using System.Globalization;
+using Njsast.SourceMap;
+using System;
+using BTDB.Collections;
+using Njsast.Bundler;
+using Njsast.Coverage;
+using Njsast.Output;
+using Njsast.Reader;
+using Njsast.Runtime;
 
 namespace Lib.TSCompiler
 {
     public class FastBundleBundler
     {
+        string _bundleJs;
         SourceMap _sourceMap;
         string _sourceMapString;
-        string _bundleJs;
+        string _bundle2Js;
+        SourceMap _sourceMap2;
+        string _sourceMap2String;
+        string _cssLink;
         string _indexHtml;
         string _versionDirPrefix;
 
         readonly IToolsDir _tools;
 
-        public FastBundleBundler(IToolsDir tools)
+        public FastBundleBundler(IToolsDir tools, MainBuildResult mainBuildResult, ProjectOptions project,
+            BuildResult buildResult)
         {
             _tools = tools;
+            _mainBuildResult = mainBuildResult;
+            _project = project;
+            _buildResult = buildResult;
         }
 
-        public ProjectOptions Project;
-        public BuildResult BuildResult;
+        readonly ProjectOptions _project;
+        readonly BuildResult _buildResult;
+        readonly MainBuildResult _mainBuildResult;
 
-        // value could be string or byte[] or Lazy<string|byte[]>
-        public Dictionary<string, object> FilesContent;
         string _bundlePng;
         List<float> _bundlePngInfo;
+        RefDictionary<string, FastBundleBundler>? _subBundlers;
 
-        public void Build(string sourceRoot, string mapUrl, bool testProj = false)
+        public Dictionary<string, SourceMap> SourceMaps;
+
+        public void Build(string sourceRoot, bool testProj = false, bool allowIncremental = true)
         {
             _versionDirPrefix = "";
-            if (Project.OutputSubDir != null)
-                _versionDirPrefix = Project.OutputSubDir + "/";
-            var root = Project.CommonSourceDirectory;
-            if (root == null)
-                return;
+            var coverage = _project.CoverageEnabled;
+            if (coverage) allowIncremental = false;
+            if (_mainBuildResult.OutputSubDir != null)
+                _versionDirPrefix = _mainBuildResult.OutputSubDir + "/";
+            var root = _mainBuildResult.CommonSourceDirectory;
+            var incremental = _buildResult.Incremental && allowIncremental;
+            var start = DateTime.UtcNow;
             var sourceMapBuilder = new SourceMapBuilder();
-            if (!testProj && Project.NoHtml)
+            if (_project.Localize)
             {
-                sourceMapBuilder.AddText(GetInitG11nCode());
-                sourceMapBuilder.AddText(_tools.LoaderJs);
-                sourceMapBuilder.AddText(GetGlobalDefines());
-                sourceMapBuilder.AddText(GetModuleMap());
-            }
-
-            sourceMapBuilder.AddText(_tools.TsLibSource);
-            var cssLink = "";
-            foreach (var source in BuildResult.Path2FileInfo)
-            {
-                if (source.Value.Type == FileCompilationType.JavaScriptAsset)
-                {
-                    sourceMapBuilder.AddSource(source.Value.Output, source.Value.MapLink);
-                }
-            }
-
-            foreach (var source in BuildResult.Path2FileInfo)
-            {
-                if (source.Value.Type == FileCompilationType.TypeScript ||
-                    source.Value.Type == FileCompilationType.JavaScript)
-                {
-                    if (source.Value.Output == null)
-                        continue; // Skip d.ts
-                    sourceMapBuilder.AddText(
-                        $"R('{PathUtils.Subtract(PathUtils.WithoutExtension(source.Key), root)}',function(require, module, exports, global){{");
-                    sourceMapBuilder.AddSource(source.Value.Output, source.Value.MapLink);
-                    sourceMapBuilder.AddText("});");
-                }
-                else if (source.Value.Type == FileCompilationType.Json)
+                if (!incremental)
                 {
                     sourceMapBuilder.AddText(
-                        $"R('{PathUtils.Subtract(source.Key, root)}',function(require, module, exports, global){{");
-                    sourceMapBuilder.AddText("Object.assign(exports, " + source.Value.Owner.Utf8Content + ");");
-                    sourceMapBuilder.AddText("});");
-                }
-                else if (source.Value.Type == FileCompilationType.Css)
-                {
-                    string cssPath = source.Value.OutputUrl;
-                    FilesContent[cssPath] = source.Value.Output;
-                    cssLink += "<link rel=\"stylesheet\" href=\"" + cssPath + "\">";
-                }
-                else if (source.Value.Type == FileCompilationType.Resource)
-                {
-                    FilesContent[source.Value.OutputUrl] = source.Value.Owner.ByteContent;
+                        $"function g11nPath(s){{return\"./{_mainBuildResult.OutputSubDirPrefix}\"+s.toLowerCase()+\".js\"}};");
+                    if (_project.DefaultLanguage != null)
+                    {
+                        sourceMapBuilder.AddText($"var g11nLoc=\"{_project.DefaultLanguage}\";");
+                    }
                 }
             }
 
-            if (Project.SpriteGeneration)
+            if (_project.SpriteGeneration)
             {
-                _bundlePng = Project.BundlePngUrl;
-                var bundlePngContent = Project.SpriteGenerator.BuildImage(false);
+                _bundlePng = _project.BundlePngUrl;
+                var bundlePngContent = _project.SpriteGenerator.BuildImage(false);
                 if (bundlePngContent != null)
                 {
                     _bundlePngInfo = new List<float>();
                     foreach (var slice in bundlePngContent)
                     {
-                        FilesContent[PathUtils.InjectQuality(_bundlePng, slice.Quality)] = slice.Content;
+                        _mainBuildResult.FilesContent.GetOrAddValueRef(
+                            PathUtils.InjectQuality(_bundlePng, slice.Quality)) = slice.Content;
                         _bundlePngInfo.Add(slice.Quality);
                     }
                 }
@@ -107,70 +92,229 @@ namespace Lib.TSCompiler
                 }
             }
 
-            if (!testProj && Project.NoHtml)
+            if (_bundlePng != null && !incremental)
+            {
+                sourceMapBuilder.AddText(GetInitSpriteCode());
+            }
+
+            if (!incremental)
+            {
+                sourceMapBuilder.AddText(_tools.LoaderJs);
+                sourceMapBuilder.AddText(GetGlobalDefines());
+                sourceMapBuilder.AddText(GetModuleMap());
+                sourceMapBuilder.AddText(BundlerHelpers.JsHeaders(false));
+            }
+
+            var cssLink = "";
+
+            var sortedResultSet = incremental
+                ? _buildResult.RecompiledIncrementaly.OrderBy(f => f.Owner.FullPath).ToArray()
+                : _buildResult.Path2FileInfo.Values.OrderBy(f => f.Owner.FullPath).ToArray();
+
+            if (!incremental)
+            {
+                foreach (var source in _buildResult.JavaScriptAssets)
+                {
+                    sourceMapBuilder.AddSource(source.Output, source.MapLink);
+                }
+            }
+
+            foreach (var source in sortedResultSet)
+            {
+                if (source.Type == FileCompilationType.TypeScript ||
+                    source.Type == FileCompilationType.EsmJavaScript ||
+                    source.Type == FileCompilationType.JavaScript)
+                {
+                    if (source.Output == null)
+                        continue; // Skip d.ts
+                    sourceMapBuilder.AddText(
+                        $"R('{PathUtils.Subtract(PathUtils.WithoutExtension(source.Owner.FullPath), root)}',function(require, module, exports, global){{");
+                    var adder = sourceMapBuilder.CreateSourceAdder(source.Output, source.MapLink);
+                    var sourceReplacer = new SourceReplacer();
+                    _project.ApplySourceInfo(sourceReplacer, source.SourceInfo, _buildResult);
+                    sourceReplacer.Apply(adder);
+                    sourceMapBuilder.AddText("\n});");
+                }
+                else if (source.Type == FileCompilationType.Json)
+                {
+                    sourceMapBuilder.AddText(
+                        $"R('{PathUtils.Subtract(source.Owner.FullPath, root)}',");
+                    sourceMapBuilder.AddText(source.Owner.Utf8Content);
+                    sourceMapBuilder.AddText(");");
+                }
+                else if (source.Type == FileCompilationType.ImportedCss)
+                {
+                    sourceMapBuilder.AddText(
+                        $"R('{PathUtils.Subtract(source.Owner.FullPath, root)}',function(){{}});");
+                    string cssPath = _buildResult.ToOutputUrl(source);
+                    _mainBuildResult.FilesContent.GetOrAddValueRef(cssPath) = source.Output;
+                    cssLink += "<link rel=\"stylesheet\" href=\"" + cssPath + "\">";
+                }
+                else if (source.Type == FileCompilationType.Css)
+                {
+                    string cssPath = _buildResult.ToOutputUrl(source);
+                    _mainBuildResult.FilesContent.GetOrAddValueRef(cssPath) = source.Output;
+                    cssLink += "<link rel=\"stylesheet\" href=\"" + cssPath + "\">";
+                }
+                else if (source.Type == FileCompilationType.Resource)
+                {
+                    _mainBuildResult.FilesContent.GetOrAddValueRef(_buildResult.ToOutputUrl(source)) =
+                        source.Owner.ByteContent;
+                }
+            }
+
+            if (!testProj && _project.NoHtml)
             {
                 sourceMapBuilder.AddText(RequireBobril());
                 sourceMapBuilder.AddText(
-                    $"R.r('{PathUtils.WithoutExtension(PathUtils.Subtract(Project.MainFile, root))}');");
+                    $"R.r('./{PathUtils.WithoutExtension(PathUtils.Subtract(_project.MainFile, root))}');");
             }
 
-            sourceMapBuilder.AddText("//# sourceMappingURL=" + mapUrl);
-            _sourceMap = sourceMapBuilder.Build(root, sourceRoot);
-            _sourceMapString = _sourceMap.ToString();
-            _bundleJs = sourceMapBuilder.Content();
-            if (!testProj && !Project.NoHtml && Project.ExampleSources.Count > 0)
+            if (_project.Localize)
             {
-                if (Project.ExampleSources.Count == 1)
+                _project.TranslationDb.BuildTranslationJs(_tools, _mainBuildResult.FilesContent,
+                    _mainBuildResult.OutputSubDir);
+            }
+
+            if (incremental)
+            {
+                sourceMapBuilder.AddText("//# sourceMappingURL=bundle2.js.map");
+                _sourceMap2 = sourceMapBuilder.Build(root, sourceRoot);
+                _sourceMap2String = _sourceMap2.ToString();
+                _bundle2Js = sourceMapBuilder.Content();
+                _project.Owner.Logger.Info("JS Bundle length: " + _bundleJs.Length + " SourceMap length: " +
+                                           _sourceMapString.Length + " Delta: " + _bundle2Js.Length + " SM:" +
+                                           _sourceMap2String.Length + " T:" +
+                                           (DateTime.UtcNow - start).TotalMilliseconds.ToString("F0") + "ms");
+            }
+            else
+            {
+                sourceMapBuilder.AddText("//# sourceMappingURL=" + PathUtils.GetFile(_buildResult.BundleJsUrl) +
+                                         ".map");
+                _sourceMap = sourceMapBuilder.Build(root, sourceRoot);
+                _bundleJs = sourceMapBuilder.Content();
+                if (coverage)
+                {
+                    var toplevel = Parser.Parse(_bundleJs);
+                    _sourceMap.ResolveInAst(toplevel);
+                    var coverageInst = new CoverageInstrumentation();
+                    _project.CoverageInstrumentation = coverageInst;
+                    toplevel = coverageInst.Instrument(toplevel);
+                    coverageInst.AddCountingHelpers(toplevel);
+                    sourceMapBuilder = new SourceMapBuilder();
+                    toplevel.PrintToBuilder(sourceMapBuilder, new OutputOptions { Beautify = true});
+                    sourceMapBuilder.AddText("//# sourceMappingURL=" + PathUtils.GetFile(_buildResult.BundleJsUrl) +
+                                             ".map");
+                    _sourceMap = sourceMapBuilder.Build(sourceRoot, sourceRoot);
+                    _bundleJs = sourceMapBuilder.Content();
+                }
+                _sourceMapString = _sourceMap.ToString();
+                _sourceMap2 = null;
+                _sourceMap2String = null;
+                _bundle2Js = null;
+                _cssLink = cssLink;
+                _project.Owner.Logger.Info("JS Bundle length: " + _bundleJs.Length + " SourceMap length: " +
+                                           _sourceMapString.Length + " T:" +
+                                           (DateTime.UtcNow - start).TotalMilliseconds.ToString("F0") + "ms");
+            }
+
+            _mainBuildResult.FilesContent.GetOrAddValueRef(_buildResult.BundleJsUrl) = _bundleJs;
+            _mainBuildResult.FilesContent.GetOrAddValueRef(_buildResult.BundleJsUrl + ".map") = _sourceMapString;
+            if (incremental)
+            {
+                _mainBuildResult.FilesContent.GetOrAddValueRef(_versionDirPrefix + "bundle2.js") = _bundle2Js;
+                _mainBuildResult.FilesContent.GetOrAddValueRef(_versionDirPrefix + "bundle2.js.map") =
+                    _sourceMap2String;
+                SourceMaps = new Dictionary<string, SourceMap>
+                {
+                    {PathUtils.GetFile(_buildResult.BundleJsUrl), _sourceMap},
+                    {"bundle2.js", _sourceMap2}
+                };
+            }
+            else
+            {
+                SourceMaps = new Dictionary<string, SourceMap>
+                {
+                    {PathUtils.GetFile(_buildResult.BundleJsUrl), _sourceMap}
+                };
+            }
+
+            if (_project.SubProjects != null)
+            {
+                var newSubBundlers = new RefDictionary<string, FastBundleBundler>();
+                foreach (var (projPath, subProject) in _project.SubProjects.OrderBy(a =>
+                    a.Value!.Variant == "serviceworker"))
+                {
+                    if (_subBundlers == null || !_subBundlers.TryGetValue(projPath, out var subBundler))
+                    {
+                        subBundler = new FastBundleBundler(_tools, _mainBuildResult, subProject,
+                            _buildResult.SubBuildResults.GetOrFakeValueRef(projPath));
+                    }
+
+                    newSubBundlers.GetOrAddValueRef(projPath) = subBundler;
+                    subBundler.Build(sourceRoot, false, false);
+                }
+
+                _subBundlers = newSubBundlers;
+            }
+            else
+            {
+                _subBundlers = null;
+            }
+        }
+
+        public void BuildHtml(bool testProj = false)
+        {
+            var root = _mainBuildResult.CommonSourceDirectory;
+            if (!testProj && !_project.NoHtml && _project.ExampleSources.Count > 0)
+            {
+                if (_project.ExampleSources.Count == 1)
                 {
                     BuildFastBundlerIndexHtml(
-                        PathUtils.WithoutExtension(PathUtils.Subtract(Project.ExampleSources[0], root)), cssLink);
+                        PathUtils.WithoutExtension(PathUtils.Subtract(_project.ExampleSources[0], root)), _cssLink);
                 }
                 else
                 {
                     var htmlList = new List<string>();
-                    foreach (var exampleSrc in Project.ExampleSources)
+                    foreach (var exampleSrc in _project.ExampleSources)
                     {
                         var moduleNameWOExt = PathUtils.WithoutExtension(PathUtils.Subtract(exampleSrc, root));
-                        BuildFastBundlerIndexHtml(moduleNameWOExt, cssLink);
-                        var justName = PathUtils.SplitDirAndFile(moduleNameWOExt).Item2;
-                        FilesContent[justName + ".html"] = _indexHtml;
+                        BuildFastBundlerIndexHtml(moduleNameWOExt, _cssLink);
+                        var justName = PathUtils.GetFile(moduleNameWOExt);
+                        _mainBuildResult.FilesContent.GetOrAddValueRef(justName + ".html") = _indexHtml;
                         htmlList.Add(justName);
                     }
 
-                    BuildExampleListHtml(htmlList, cssLink);
+                    BuildExampleListHtml(htmlList, _cssLink);
                 }
             }
             else if (testProj)
             {
-                BuildFastBundlerTestHtml(Project.TestSources, root, cssLink);
+                BuildFastBundlerTestHtml(_project.TestSources, root, _cssLink);
             }
-            else if (!Project.NoHtml)
+            else if (!_project.NoHtml)
             {
-                BuildFastBundlerIndexHtml(PathUtils.WithoutExtension(PathUtils.Subtract(Project.MainFile, root)),
-                    cssLink);
+                BuildFastBundlerIndexHtml(PathUtils.WithoutExtension(PathUtils.Subtract(_project.MainFile, root)),
+                    _cssLink);
             }
 
             if (testProj)
             {
-                FilesContent["test.html"] = _indexHtml;
-                FilesContent[_versionDirPrefix + "jasmine-core.js"] = _tools.JasmineCoreJs;
-                FilesContent[_versionDirPrefix + "jasmine-boot.js"] = _tools.JasmineBootJs;
-                FilesContent[_versionDirPrefix + "loader.js"] = _tools.LoaderJs;
+                _mainBuildResult.FilesContent.GetOrAddValueRef("test.html") = _indexHtml;
+                _mainBuildResult.FilesContent.GetOrAddValueRef(_versionDirPrefix + "jasmine-core.js") =
+                    _tools.JasmineCoreJs;
+                _mainBuildResult.FilesContent.GetOrAddValueRef(_versionDirPrefix + "jasmine-boot.js") =
+                    _tools.JasmineBootJs;
             }
-            else if (!Project.NoHtml)
+            else if (!_project.NoHtml)
             {
-                FilesContent["index.html"] = _indexHtml;
-                FilesContent[_versionDirPrefix + "loader.js"] = _tools.LoaderJs;
-                if (Project.LiveReloadEnabled)
+                _mainBuildResult.FilesContent.GetOrAddValueRef("index.html") = _indexHtml;
+                if (_project.LiveReloadEnabled)
                 {
-                    FilesContent[_versionDirPrefix + "liveReload.js"] =
-                        _tools.LiveReloadJs.Replace("##Idx##", (Project.LiveReloadIdx + 1).ToString());
+                    _mainBuildResult.FilesContent.GetOrAddValueRef(_versionDirPrefix + "liveReload.js") =
+                        _tools.LiveReloadJs.Replace("##Idx##", (_project.LiveReloadIdx + 1).ToString());
                 }
             }
-
-            FilesContent[_versionDirPrefix + PathUtils.WithoutExtension(mapUrl)] = _bundleJs;
-            FilesContent[_versionDirPrefix + mapUrl] = _sourceMapString;
-            BuildResult.SourceMap = _sourceMap;
         }
 
         void BuildFastBundlerTestHtml(IEnumerable<string> testSources, string root, string cssLink)
@@ -179,23 +323,18 @@ namespace Lib.TSCompiler
                 testSources.Where(src => !src.EndsWith(".d.ts")).Select(src =>
                 {
                     var name = PathUtils.WithoutExtension(PathUtils.Subtract(src, root));
-                    return $"R.r('{name}');\n";
+                    return $"R.r('./{name}');\n";
                 }));
             _indexHtml = $@"<!DOCTYPE html>
 <html>
     <head>
-        <meta charset=""utf-8"">{Project.HtmlHeadExpanded}
-        <title>{Project.Title}</title>{cssLink}
+        <meta charset=""utf-8"">{_project.ExpandHtmlHead(_buildResult)}
+        <title>{_project.Title}</title>{cssLink}
     </head>
-    <body>{InitG11n()}
+    <body>
         <script src=""{_versionDirPrefix}jasmine-core.js"" charset=""utf-8""></script>
         <script src=""{_versionDirPrefix}jasmine-boot.js"" charset=""utf-8""></script>
-        <script src=""{_versionDirPrefix}loader.js"" charset=""utf-8""></script>
-        <script>
-            {GetGlobalDefines()}
-            {GetModuleMap()}
-        </script>
-        <script src=""{_versionDirPrefix}testbundle.js"" charset=""utf-8""></script>
+        <script src=""{_buildResult.BundleJsUrl}"" charset=""utf-8""></script>{ImportBundle2()}
         <script>
             {RequireBobril()}
             {reqSpec}
@@ -208,7 +347,7 @@ namespace Lib.TSCompiler
         void BuildFastBundlerIndexHtml(string mainModule, string cssLink)
         {
             var liveReloadInclude = "";
-            if (Project.LiveReloadEnabled)
+            if (_project.LiveReloadEnabled)
             {
                 liveReloadInclude = $@"<script src=""{_versionDirPrefix}liveReload.js"" charset=""utf-8""></script>";
             }
@@ -216,66 +355,50 @@ namespace Lib.TSCompiler
             _indexHtml = $@"<!DOCTYPE html>
 <html>
     <head>
-        <meta charset=""utf-8"">{Project.HtmlHeadExpanded}
-        <title>{Project.Title}</title>{cssLink}
+        <meta charset=""utf-8"">{_project.ExpandHtmlHead(_buildResult)}
+        <title>{_project.Title}</title>{cssLink}
     </head>
-    <body>{InitG11n()}
-        <script src=""{_versionDirPrefix}loader.js"" charset=""utf-8""></script>{liveReloadInclude}
-        <script>
-            {GetGlobalDefines()}
-            {GetModuleMap()}
-        </script>
-        <script src=""{_versionDirPrefix}bundle.js"" charset=""utf-8""></script>
+    <body>{liveReloadInclude}
+        <script src=""{_buildResult.BundleJsUrl}"" charset=""utf-8""></script>{ImportBundle2()}
         <script>
             {RequireBobril()}
-            R.r('{mainModule}');
+            R.r('./{mainModule}');
         </script>
     </body>
 </html>
 ";
         }
 
-        string GetInitG11nCode()
+        string ImportBundle2()
         {
-            var res = new StringBuilder();
-            if (Project.Localize)
+            var importBundle2 = "";
+            if (_bundle2Js != null)
             {
-                Project.TranslationDb.BuildTranslationJs(_tools, FilesContent, Project.OutputSubDir);
-                res.Append(
-                    $"function g11nPath(s){{return\"./{(Project.OutputSubDir != null ? (Project.OutputSubDir + "/") : "")}\"+s.toLowerCase()+\".js\"}};");
-                if (Project.DefaultLanguage != null)
-                {
-                    res.Append($"var g11nLoc=\"{Project.DefaultLanguage}\";");
-                }
+                importBundle2 = $@"<script src=""{_versionDirPrefix}bundle2.js"" charset=""utf-8""></script>";
             }
 
-            if (_bundlePng != null)
-            {
-                res.Append($"var bobrilBPath=\"{_bundlePng}\"");
-                if (_bundlePngInfo.Count > 1)
-                {
-                    res.Append($",bobrilBPath2=[");
-                    for (var i = 1; i < _bundlePngInfo.Count; i++)
-                    {
-                        var q = _bundlePngInfo[i];
-                        if (i > 1) res.Append(",");
-                        res.Append(
-                            $"[\"{PathUtils.InjectQuality(_bundlePng, q)}\",{q.ToString(CultureInfo.InvariantCulture)}]");
-                    }
+            return importBundle2;
+        }
 
-                    res.Append("]");
+        string GetInitSpriteCode()
+        {
+            var res = new StringBuilder();
+            res.Append($"var bobrilBPath=\"{_bundlePng}\"");
+            if (_bundlePngInfo.Count > 1)
+            {
+                res.Append($",bobrilBPath2=[");
+                for (var i = 1; i < _bundlePngInfo.Count; i++)
+                {
+                    var q = _bundlePngInfo[i];
+                    if (i > 1) res.Append(",");
+                    res.Append(
+                        $"[\"{PathUtils.InjectQuality(_bundlePng, q)}\",{q.ToString(CultureInfo.InvariantCulture)}]");
                 }
+
+                res.Append("]");
             }
 
             return res.ToString();
-        }
-
-        string InitG11n()
-        {
-            if (!Project.Localize && _bundlePng == null)
-                return "";
-            var res = $"<script>{GetInitG11nCode()}</script>";
-            return res;
         }
 
         void BuildExampleListHtml(List<string> namesWOExt, string cssLink)
@@ -289,8 +412,8 @@ namespace Lib.TSCompiler
             _indexHtml = $@"<!DOCTYPE html>
 <html>
     <head>
-        <meta charset=""utf-8"">{Project.HtmlHeadExpanded}
-        <title>${Project.Title}</title>${cssLink}
+        <meta charset=""utf-8"">{_project.ExpandHtmlHead(_buildResult)}
+        <title>${_project.Title}</title>${cssLink}
     </head>
     <body>
     <ul>{testList}</ul>
@@ -300,11 +423,10 @@ namespace Lib.TSCompiler
 
         string GetGlobalDefines()
         {
-            if (Project.Defines == null) return "";
             var res = new StringBuilder();
-            foreach (var def in Project.Defines)
+            foreach (var def in _project.BuildDefines(_mainBuildResult))
             {
-                var val = def.Value ? "true" : "false";
+                var val = TypeConverter.ToAst(def.Value).PrintToString();
                 res.Append($"var {def.Key} = {val};");
             }
 
@@ -313,15 +435,61 @@ namespace Lib.TSCompiler
 
         string GetModuleMap()
         {
-            var root = Project.CommonSourceDirectory;
+            var root = _mainBuildResult.CommonSourceDirectory;
             var res = new Dictionary<string, string>();
-            foreach (var source in BuildResult.Path2FileInfo)
+            foreach (var source in _buildResult.Modules)
             {
-                var module = source.Value.ImportedAsModule;
-                if (module != null)
+                if (!source.Value.Valid) continue;
+                res.TryAdd(source.Key.ToLowerInvariant(),
+                    PathUtils.Subtract(
+                        PathUtils.Join(source.Value.Owner.FullPath, PathUtils.WithoutExtension(source.Value.MainFile)),
+                        root));
+                res.TryAdd(source.Key.ToLowerInvariant() + "/",
+                    PathUtils.Subtract(PathUtils.WithoutExtension(source.Value.Owner.FullPath), root));
+                var browserResolve = source.Value.ProjectOptions?.BrowserResolve;
+                if (browserResolve != null)
                 {
-                    res.Add(module.ToLowerInvariant(),
-                        PathUtils.Subtract(PathUtils.WithoutExtension(source.Key), root));
+                    foreach (var (key, value) in browserResolve)
+                    {
+                        if (key.StartsWith('.'))
+                        {
+                            if (value == null)
+                            {
+                                res.TryAdd(
+                                    PathUtils.Subtract(
+                                            PathUtils.Join(source.Value.Owner.FullPath,
+                                                PathUtils.WithoutExtension(key)),
+                                            root)
+                                        .ToLowerInvariant(), "<empty>");
+                            }
+                            else
+                            {
+                                res.TryAdd(
+                                    PathUtils.Subtract(
+                                            PathUtils.Join(source.Value.Owner.FullPath,
+                                                PathUtils.WithoutExtension(key)),
+                                            root)
+                                        .ToLowerInvariant(),
+                                    PathUtils.Subtract(
+                                        PathUtils.Join(source.Value.Owner.FullPath, PathUtils.WithoutExtension(value)),
+                                        root));
+                            }
+                        }
+                        else
+                        {
+                            if (value == null)
+                            {
+                                res.TryAdd(key.ToLowerInvariant(), "<empty>");
+                            }
+                            else
+                            {
+                                res.TryAdd(key.ToLowerInvariant(),
+                                    PathUtils.Subtract(
+                                        PathUtils.Join(source.Value.Owner.FullPath, PathUtils.WithoutExtension(value)),
+                                        root));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -331,7 +499,7 @@ namespace Lib.TSCompiler
         // Bobril must be first because it contains polyfills
         string RequireBobril()
         {
-            if (BuildResult.Path2FileInfo.ContainsKey(Project.Owner.Owner.FullPath + "/node_modules/bobril/index.ts"))
+            if (_buildResult.Modules.ContainsKey("bobril"))
             {
                 return "R.r('bobril');";
             }

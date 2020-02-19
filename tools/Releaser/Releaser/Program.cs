@@ -86,8 +86,8 @@ namespace Releaser
                     releaseLogLines.RemoveAt(releaseLogLines.Count - 1);
                 outputLogLines.Insert(topVersionLine + 1, "## " + newVersion);
                 outputLogLines.Insert(topVersionLine + 1, "");
-                if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp2.1"))
-                    Directory.Delete(projDir + "/bb/bin/Release/netcoreapp2.1", true);
+                if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp3.1"))
+                    Directory.Delete(projDir + "/bb/bin/Release/netcoreapp3.1", true);
                 BuildWinX64(projDir, newVersion);
                 BuildLinuxX64(projDir, newVersion);
                 BuildOsxX64(projDir, newVersion);
@@ -146,7 +146,22 @@ namespace Releaser
 
         static void DockerBuild(string projDir, string version)
         {
-            var start = new ProcessStartInfo("docker", $"build . -t bobril/build --build-arg VERSION={version}")
+            try
+            {
+                RunDocker(projDir, $"build . -t bobril/build --build-arg VERSION={version}");
+                RunDocker(projDir, $"tag bobril/build bobril/build:{version}");
+                RunDocker(projDir, $"push bobril/build:{version}");
+                RunDocker(projDir, $"push bobril/build:latest");
+            }
+            catch (Exception)
+            {
+                Console.WriteLine("Docker build failed");
+            }
+        }
+
+        static void RunDocker(string projDir, string command)
+        {
+            var start = new ProcessStartInfo("docker", command)
             {
                 UseShellExecute = true,
                 WorkingDirectory = projDir
@@ -157,32 +172,7 @@ namespace Releaser
             if (process.ExitCode > 0)
             {
                 Console.WriteLine($"Exit code:{process.ExitCode}");
-                return;
-            }
-            start = new ProcessStartInfo("docker", $"tag bobril/build bobril/build:{version}")
-            {
-                UseShellExecute = true,
-                WorkingDirectory = projDir
-            };
-            Console.WriteLine($"Starting docker {start.Arguments}");
-            process = Process.Start(start);
-            process.WaitForExit();
-            if (process.ExitCode > 0)
-            {
-                Console.WriteLine($"Exit code:{process.ExitCode}");
-                return;
-            }
-            start = new ProcessStartInfo("docker", $"push bobril/build:{version}")
-            {
-                UseShellExecute = true,
-                WorkingDirectory = projDir
-            };
-            Console.WriteLine($"Starting docker {start.Arguments}");
-            process = Process.Start(start);
-            process.WaitForExit();
-            if (process.ExitCode > 0)
-            {
-                Console.WriteLine($"Exit code:{process.ExitCode}");
+                throw new Exception("Docker failed");
             }
         }
 
@@ -192,7 +182,7 @@ namespace Releaser
             {
                 try
                 {
-                    return await client.Repository.Release.UploadAsset(release2, new ReleaseAssetUpload(fileName, "application/zip", File.OpenRead(projDir + "/bb/bin/Release/netcoreapp2.1/" + fileName), TimeSpan.FromMinutes(14)));
+                    return await client.Repository.Release.UploadAsset(release2, new ReleaseAssetUpload(fileName, "application/zip", File.OpenRead(projDir + "/bb/bin/Release/netcoreapp3.1/" + fileName), TimeSpan.FromMinutes(14)));
                 }
                 catch (Exception)
                 {
@@ -211,9 +201,9 @@ namespace Releaser
             };
             var process = Process.Start(start);
             process.WaitForExit();
-            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp2.1/win10-x64/publish/ru-ru"))
-                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp2.1/win10-x64/publish/ru-ru", true);
-            System.IO.Compression.ZipFile.CreateFromDirectory(projDir + "/bb/bin/Release/netcoreapp2.1/win10-x64/publish", projDir + "/bb/bin/Release/netcoreapp2.1/win-x64.zip", System.IO.Compression.CompressionLevel.Optimal, false);
+            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp3.1/win10-x64/publish/ru-ru"))
+                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp3.1/win10-x64/publish/ru-ru", true);
+            System.IO.Compression.ZipFile.CreateFromDirectory(projDir + "/bb/bin/Release/netcoreapp3.1/win10-x64/publish", projDir + "/bb/bin/Release/netcoreapp3.1/win-x64.zip", System.IO.Compression.CompressionLevel.Optimal, false);
         }
 
         static void BuildLinuxX64(string projDir, string newVersion)
@@ -225,11 +215,11 @@ namespace Releaser
             };
             var process = Process.Start(start);
             process.WaitForExit();
-            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp2.1/linux-x64/publish/ru-ru"))
-                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp2.1/linux-x64/publish/ru-ru", true);
-            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp2.1/linux-x64/publish/Resources"))
-                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp2.1/linux-x64/publish/Resources", true);
-            System.IO.Compression.ZipFile.CreateFromDirectory(projDir + "/bb/bin/Release/netcoreapp2.1/linux-x64/publish", projDir + "/bb/bin/Release/netcoreapp2.1/linux-x64.zip", System.IO.Compression.CompressionLevel.Optimal, false);
+            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp3.1/linux-x64/publish/ru-ru"))
+                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp3.1/linux-x64/publish/ru-ru", true);
+            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp3.1/linux-x64/publish/Resources"))
+                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp3.1/linux-x64/publish/Resources", true);
+            System.IO.Compression.ZipFile.CreateFromDirectory(projDir + "/bb/bin/Release/netcoreapp3.1/linux-x64/publish", projDir + "/bb/bin/Release/netcoreapp3.1/linux-x64.zip", System.IO.Compression.CompressionLevel.Optimal, false);
         }
 
         static void BuildOsxX64(string projDir, string newVersion)
@@ -241,11 +231,11 @@ namespace Releaser
             };
             var process = Process.Start(start);
             process.WaitForExit();
-            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp2.1/osx-x64/publish/ru-ru"))
-                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp2.1/osx-x64/publish/ru-ru", true);
-            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp2.1/osx-x64/publish/Resources"))
-                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp2.1/osx-x64/publish/Resources", true);
-            System.IO.Compression.ZipFile.CreateFromDirectory(projDir + "/bb/bin/Release/netcoreapp2.1/osx-x64/publish", projDir + "/bb/bin/Release/netcoreapp2.1/osx-x64.zip", System.IO.Compression.CompressionLevel.Optimal, false);
+            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp3.1/osx-x64/publish/ru-ru"))
+                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp3.1/osx-x64/publish/ru-ru", true);
+            if (Directory.Exists(projDir + "/bb/bin/Release/netcoreapp3.1/osx-x64/publish/Resources"))
+                Directory.Delete(projDir + "/bb/bin/Release/netcoreapp3.1/osx-x64/publish/Resources", true);
+            System.IO.Compression.ZipFile.CreateFromDirectory(projDir + "/bb/bin/Release/netcoreapp3.1/osx-x64/publish", projDir + "/bb/bin/Release/netcoreapp3.1/osx-x64.zip", System.IO.Compression.CompressionLevel.Optimal, false);
         }
     }
 }

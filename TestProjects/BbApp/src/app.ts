@@ -1,7 +1,13 @@
 import * as b from "bobril";
 import * as g from "bobril-g11n";
+import * as deep from "bobril-g11n/src/jsonp";
 import lightSwitch from "./lightSwitch";
 import * as json from "./json.json";
+import "./polyfills";
+import * as styles from "./styles";
+
+declare var process: { env: Record<string, string> };
+declare var DEBUG: boolean;
 
 interface IPageCtx extends b.IBobrilCtx {
     counter: number;
@@ -19,6 +25,8 @@ function dontDoThis(cn: string) {
 }
 
 dontDoThis("try");
+
+if (!b.isFunction(deep.jsonp)) console.error("deep import");
 
 let switchValue = false;
 
@@ -88,7 +96,33 @@ let page = b.createVirtualComponent({
             },
             {
                 tag: "p",
+                children: "DEBUG: " + DEBUG
+            },
+            {
+                tag: "p",
                 children: "Current locale: " + g.getLocale()
+            },
+            {
+                tag: "p",
+                children: "process.env.NODE_ENV: " + process.env.NODE_ENV
+            },
+            {
+                tag: "p",
+                children: "process.env.UnKnOwN: " + process.env.UnKnOwN
+            },
+            {
+                tag: "div",
+                style: { display: "table", tableLayout: "fixed", width: "100%" },
+                children: {
+                    tag: "div",
+                    style: {
+                        display: "table-cell",
+                        whiteSpace: "nowrap",
+                        textOverflow: "ellipsis",
+                        overflow: "hidden"
+                    },
+                    children: "Path: " + process.env.Path
+                }
             },
             {
                 tag: "p",
@@ -100,6 +134,7 @@ let page = b.createVirtualComponent({
                     "Number 123456.789 in format 0,0.00: " +
                     g.f("{arg, number, custom, format:{0,0.00}}", { arg: 123456.789 })
             },
+            b.style({ tag: "div", children: "blue on red" }, styles.style1, styles.style2),
             {
                 tag: "p",
                 children: "cs-CZ",

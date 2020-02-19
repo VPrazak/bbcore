@@ -3,35 +3,38 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using Lib.DiskCache;
 using Lib.Spriter;
 using Lib.Utils;
+using Lib.Utils.Logger;
+using Njsast.Bobril;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
-using SixLabors.ImageSharp.Processing.Drawing;
 using SixLabors.ImageSharp.Processing.Processors;
-using SixLabors.ImageSharp.Processing.Transforms;
-using SixLabors.Primitives;
 
 namespace Lib.TSCompiler
 {
     public class SpriteHolder : ISpritePlace
     {
         IDiskCache _dc;
+        ILogger _logger;
         Sprite2dPlacer _placer;
-        List<SourceInfo.Sprite> _allSprites;
-        List<SourceInfo.Sprite> _newSprites;
+        List<OutputSprite> _allSprites;
+        List<OutputSprite> _newSprites;
         IReadOnlyList<ImageBytesWithQuality> _result;
+        Dictionary<string, TSFileAdditionalInfo> _imageCache = new Dictionary<string, TSFileAdditionalInfo>();
         bool _wasChange;
 
-        public SpriteHolder(IDiskCache dc)
+        public SpriteHolder(IDiskCache dc, ILogger logger)
         {
-            this._dc = dc;
+            _dc = dc;
+            _logger = logger;
             _placer = new Sprite2dPlacer();
-            _allSprites = new List<SourceInfo.Sprite>();
-            _newSprites = new List<SourceInfo.Sprite>();
+            _allSprites = new List<OutputSprite>();
+            _newSprites = new List<OutputSprite>();
         }
 
         int _sX, _sY, _sW, _sH;
@@ -41,12 +44,12 @@ namespace Lib.TSCompiler
         int ISpritePlace.X { get => _sX; set => _sX = value; }
         int ISpritePlace.Y { get => _sY; set => _sY = value; }
 
-        static int FindSprite(List<SourceInfo.Sprite> where, in SourceInfo.Sprite what)
+        static int FindSprite(List<OutputSprite> where, in SourceInfo.Sprite what)
         {
             for (int i = 0; i < where.Count; i++)
             {
                 var item = where[i];
-                if (item.name == what.name && item.color == what.color)
+                if (item.Me.Name == what.Name && item.Me.Color == what.Color)
                     return i;
             }
             return -1;
@@ -56,10 +59,10 @@ namespace Lib.TSCompiler
         {
             foreach (var sprite in sprites)
             {
-                if (sprite.name != null && sprite.oheight == 0 && sprite.owidth == 0)
+                if (sprite.Name != null && sprite.Height == -1 && sprite.Width == -1)
                 {
                     if (FindSprite(_allSprites, sprite) < 0 && FindSprite(_newSprites, sprite) < 0)
-                        _newSprites.Add(sprite);
+                        _newSprites.Add(new OutputSprite { Me = sprite });
                 }
             }
         }
@@ -69,8 +72,7 @@ namespace Lib.TSCompiler
             for (int i = 0; i < _allSprites.Count; i++)
             {
                 var sprite = _allSprites[i];
-                ProcessOneSprite(ref sprite);
-                _allSprites[i] = sprite;
+                _allSprites[i] = ProcessOneSprite(sprite.Me);
             }
             if (_newSprites.Count == 0)
                 return;
@@ -78,8 +80,7 @@ namespace Lib.TSCompiler
             for (int i = 0; i < _newSprites.Count; i++)
             {
                 var sprite = _newSprites[i];
-                ProcessOneSprite(ref sprite);
-                _newSprites[i] = sprite;
+                _newSprites[i] = ProcessOneSprite(sprite.Me);
             }
             _newSprites.Sort((l, r) => r.oheight.CompareTo(l.oheight));
             for (int i = 0; i < _newSprites.Count; i++)
@@ -95,11 +96,11 @@ namespace Lib.TSCompiler
             _newSprites.Clear();
         }
 
-        void ProcessOneSprite(ref SourceInfo.Sprite sprite)
+        OutputSprite ProcessOneSprite(SourceInfo.Sprite sprite)
         {
-            var fn = sprite.name;
-            var fnSplit = PathUtils.SplitDirAndFile(fn);
-            var dirc = _dc.TryGetItem(fnSplit.Item1);
+            var fn = sprite.Name;
+            var fnD = PathUtils.SplitDirAndFile(fn, out var fnF);
+            var dirc = _dc.TryGetItem(fnD);
             var slices = new List<SpriteSlice>();
             if (dirc is IDirectoryCache)
             {
@@ -108,55 +109,75 @@ namespace Lib.TSCompiler
                 {
                     if (!item.IsFile || item.IsInvalid) continue;
                     var (Name, Quality) = PathUtils.ExtractQuality(item.Name);
-                    if (Name == fnSplit.Item2)
+                    if (Name.AsSpan().SequenceEqual(fnF))
                     {
-                        var fi = TSFileAdditionalInfo.Get(item as IFileCache, _dc);
+                        if (!_imageCache.TryGetValue(item.FullPath,out var fi))
+                        {
+                            fi = TSFileAdditionalInfo.Create(item as IFileCache, _dc);
+                            _imageCache.Add(item.FullPath, fi);
+                        }
                         if (fi.ImageCacheId != item.ChangeId)
                         {
                             _wasChange = true;
-                            fi.Image = Image.Load((item as IFileCache).ByteContent);
+                            try
+                            {
+                                fi.Image = Image.Load((item as IFileCache).ByteContent);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.Error("Failed to load sprite " + item.FullPath + " as image. " + ex.Message);
+                                continue;
+                            }
                             fi.ImageCacheId = item.ChangeId;
                         }
                         slices.Add(new SpriteSlice { name = item.Name, quality = Quality, width = fi.Image.Width, height = fi.Image.Height });
                     }
                 }
                 slices.Sort((l, r) => l.quality < r.quality ? -1 : l.quality > r.quality ? 1 : 0);
-                sprite.slices = slices.ToArray();
-                if (sprite.slices.Length>0)
+                var res = new OutputSprite
                 {
-                    sprite.owidth = (int)(slices[0].width / slices[0].quality + 0.5);
-                    sprite.oheight = (int)(slices[0].height / slices[0].quality + 0.5);
+                    Me = sprite,
+                    slices = slices.ToArray()
+                };
+                if (slices.Count > 0)
+                {
+                    res.owidth = (int)(slices[0].width / slices[0].quality + 0.5);
+                    res.oheight = (int)(slices[0].height / slices[0].quality + 0.5);
                 }
                 else
                 {
-                    sprite.owidth = 0;
-                    sprite.oheight = 0;
+                    res.owidth = 0;
+                    res.oheight = 0;
                 }
+                return res;
             }
+            return new OutputSprite();
         }
 
-        public void Retrieve(List<SourceInfo.Sprite> sprites)
+        public List<OutputSprite> Retrieve(List<SourceInfo.Sprite> sprites)
         {
+            var res = new List<OutputSprite>(sprites.Count);
             for (int i = 0; i < sprites.Count; i++)
             {
-                var sprite = sprites[i];
-                if (sprite.name != null && sprite.oheight == 0 && sprite.owidth == 0)
+                var sprite = new OutputSprite { Me = sprites[i] };
+                if (sprite.Me.Name != null && sprite.Me.Height == -1 && sprite.Me.Width == -1)
                 {
-                    var idx = FindSprite(_allSprites, sprite);
+                    var idx = FindSprite(_allSprites, sprite.Me);
                     var s = _allSprites[idx];
-                    if (sprite.height != null)
-                        sprite.oheight = Math.Min(s.oheight, sprite.height.Value);
+                    if (sprite.Me.Height >= 0)
+                        sprite.oheight = Math.Min(s.oheight, sprite.Me.Height);
                     else
                         sprite.oheight = s.oheight;
-                    if (sprite.width != null)
-                        sprite.owidth = Math.Min(s.owidth, sprite.width.Value);
+                    if (sprite.Me.Width >= 0)
+                        sprite.owidth = Math.Min(s.owidth, sprite.Me.Width);
                     else
                         sprite.owidth = s.owidth;
-                    sprite.ox = s.ox + Math.Max(0, Math.Min(sprite.x.GetValueOrDefault(), s.owidth - sprite.owidth));
-                    sprite.oy = s.oy + Math.Max(0, Math.Min(sprite.y.GetValueOrDefault(), s.oheight - sprite.oheight));
-                    sprites[i] = sprite;
+                    sprite.ox = s.ox + Math.Max(0, Math.Min(sprite.Me.X, s.owidth - sprite.owidth));
+                    sprite.oy = s.oy + Math.Max(0, Math.Min(sprite.Me.Y, s.oheight - sprite.oheight));
                 }
+                res.Add(sprite);
             }
+            return res;
         }
 
         public struct ImageBytesWithQuality
@@ -193,20 +214,18 @@ namespace Lib.TSCompiler
                 var resultImage = new Image<Rgba32>((int)Math.Ceiling(_placer.Dim.Width * q), (int)Math.Ceiling(_placer.Dim.Height * q));
                 resultImage.Mutate(c =>
                 {
-                    c.Fill(Rgba32.Transparent);
                     for (int j = 0; j < _allSprites.Count; j++)
                     {
                         var sprite = _allSprites[j];
-                        var fn = sprite.name;
+                        var fn = sprite.Me.Name;
                         var slice = FindBestSlice(sprite.slices, q);
-                        var f = _dc.TryGetItem(PathUtils.InjectQuality(fn, slice.quality));
-                        if (f is IFileCache)
+                        var fi = _imageCache[PathUtils.InjectQuality(fn, slice.quality)];
+                        if (fi != null)
                         {
-                            var fi = TSFileAdditionalInfo.Get(f as IFileCache, _dc);
                             var image = fi.Image;
-                            if (sprite.color != null)
+                            if (sprite.Me.Color != null)
                             {
-                                Rgba32 rgbColor = ParseColor(sprite.color);
+                                var rgbColor = ParseColor(sprite.Me.Color);
                                 image = image.Clone(operation =>
                                 {
                                     operation.ApplyProcessor(new Recolor(rgbColor));
@@ -216,9 +235,9 @@ namespace Lib.TSCompiler
                             {
                                 if (q != slice.quality)
                                     operation = operation.Resize((int)Math.Round(image.Width * q / slice.quality), (int)Math.Round(image.Height * q / slice.quality));
-                                operation.Crop(new Rectangle(new Point((int)(q * (sprite.x ?? 0)), (int)(q * (sprite.y ?? 0))), new Size((int)(sprite.owidth * q), (int)(sprite.oheight * q))));
+                                operation.Crop(new Rectangle(new Point((int)(q * Math.Max(0,sprite.Me.X)), (int)(q * Math.Max(0,sprite.Me.Y))), new Size((int)(sprite.owidth * q), (int)(sprite.oheight * q))));
                             });
-                            c.DrawImage(new GraphicsOptions(), image, new Point((int)(sprite.ox * q), (int)(sprite.oy * q)));
+                            c.DrawImage(image, new Point((int)(sprite.ox * q), (int)(sprite.oy * q)), new GraphicsOptions());
                         }
                     }
                 });
@@ -279,7 +298,61 @@ namespace Lib.TSCompiler
             throw new InvalidDataException("Cannot parse color " + color);
         }
 
-        class Recolor : IImageProcessor<Rgba32>
+        class RealRecolor : IImageProcessor<Rgba32>
+        {
+            Rgba32 _rgbColor;
+            Image<Rgba32> _source;
+            Rectangle _sourceRectangle;
+
+            public RealRecolor(Rgba32 rgbColor, Image<Rgba32> source, Rectangle sourceRectangle)
+            {
+                _rgbColor = rgbColor;
+                _source = source;
+                _sourceRectangle = sourceRectangle;
+            }
+
+            public void Execute()
+            {
+                var cgray = new Bgr24(128, 128, 128);
+                var frame = _source.Frames.RootFrame;
+                if (_rgbColor.A == 255)
+                {
+                    for (var y = 0; y < frame.Height; y++)
+                    for (var x = 0; x < frame.Width; x++)
+                    {
+                        var c = frame[x, y];
+                        if (cgray.Equals(c.Bgr))
+                        {
+                            var alpha = c.A;
+                            c = _rgbColor;
+                            c.A = alpha;
+                            frame[x, y] = c;
+                        }
+                    }
+                }
+                else
+                {
+                    for (int y = 0; y < frame.Height; y++)
+                    for (int x = 0; x < frame.Width; x++)
+                    {
+                        var c = frame[x, y];
+                        if (cgray.Equals(c.Bgr))
+                        {
+                            var alpha = c.A;
+                            c = _rgbColor;
+                            c.A = (byte)(((c.A * alpha) * 32897) >> 23); // clever divide by 255
+                            frame[x, y] = c;
+                        }
+                    }
+                }
+            }
+
+            public void Dispose()
+            {
+            }
+        }
+
+        class Recolor : IImageProcessor
         {
             Rgba32 _rgbColor;
 
@@ -288,43 +361,12 @@ namespace Lib.TSCompiler
                 _rgbColor = rgbColor;
             }
 
-            public void Apply(Image<Rgba32> source, Rectangle sourceRectangle)
+            public IImageProcessor<TPixel> CreatePixelSpecificProcessor<TPixel>(SixLabors.ImageSharp.Configuration configuration, Image<TPixel> source,
+                Rectangle sourceRectangle) where TPixel : struct, IPixel<TPixel>
             {
-                var cgray = new Bgr24(128, 128, 128);
-                var frame = source.Frames.RootFrame;
-                var crgb = new Bgr24();
-                if (_rgbColor.A == 255)
-                {
-                    for (int y = 0; y < frame.Height; y++)
-                        for (int x = 0; x < frame.Width; x++)
-                        {
-                            var c = frame[x, y];
-                            c.ToBgr24(ref crgb);
-                            if (cgray.Equals(crgb))
-                            {
-                                var alpha = c.A;
-                                c = _rgbColor;
-                                c.A = alpha;
-                                frame[x, y] = c;
-                            }
-                        }
-                }
-                else
-                {
-                    for (int y = 0; y < frame.Height; y++)
-                        for (int x = 0; x < frame.Width; x++)
-                        {
-                            var c = frame[x, y];
-                            c.ToBgr24(ref crgb);
-                            if (cgray.Equals(crgb))
-                            {
-                                var alpha = c.A;
-                                c = _rgbColor;
-                                c.A = (byte)(((c.A * alpha) * 32897) >> 23); // clever divide by 255
-                                frame[x, y] = c;
-                            }
-                        }
-                }
+                if (typeof(TPixel)==typeof(Rgba32))
+                    return Unsafe.As<IImageProcessor<TPixel>>(new RealRecolor(_rgbColor, Unsafe.As<Image<Rgba32>>(source), sourceRectangle));
+                throw new NotSupportedException();
             }
         }
     }

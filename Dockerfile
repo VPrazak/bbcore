@@ -1,4 +1,4 @@
-FROM microsoft/dotnet:2.1-sdk-stretch AS build
+FROM mcr.microsoft.com/dotnet/core/sdk:3.1 AS build
 
 ARG VERSION=0.0.0
 
@@ -8,6 +8,7 @@ WORKDIR /app
 COPY nuget.config ./
 COPY bb/*.csproj ./bb/
 COPY Lib/*.csproj ./Lib/
+COPY Njsast/*.csproj ./Njsast/
 WORKDIR /app/bb
 RUN dotnet restore
 
@@ -15,12 +16,13 @@ RUN dotnet restore
 WORKDIR /app/
 COPY bb/. ./bb/
 COPY Lib/. ./Lib/
+COPY Njsast/. ./Njsast/
 WORKDIR /app/bb
 RUN dotnet publish -c Release -r linux-x64 -o out -p:Version=$VERSION.0
 RUN rm -r ./out/ru-ru
 RUN rm -r ./out/Resources
 
-FROM microsoft/dotnet:2.1-runtime-deps-stretch-slim AS runtime
+FROM mcr.microsoft.com/dotnet/core/runtime:3.1 AS runtime
 
 # Install deps + add Chrome, Nodejs, Yarn + clean up
 RUN apt-get update && apt-get install -y \
@@ -29,9 +31,9 @@ RUN apt-get update && apt-get install -y \
 	curl \
 	gnupg \
 	--no-install-recommends \
-    && curl -sL https://deb.nodesource.com/setup_10.x | bash - \
-    && curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | apt-key add - \
-    && echo "deb https://dl.yarnpkg.com/debian/ stable main" > /etc/apt/sources.list.d/yarn.list \
+	&& curl -sL https://deb.nodesource.com/setup_10.x | bash - \
+	&& curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | apt-key add - \
+	&& echo "deb https://dl.yarnpkg.com/debian/ stable main" > /etc/apt/sources.list.d/yarn.list \
 	&& curl -sSL https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
 	&& echo "deb https://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
 	&& apt-get update && apt-get install -y \
@@ -43,9 +45,8 @@ RUN apt-get update && apt-get install -y \
 	fonts-kacst \
 	fonts-symbola \
 	fonts-noto \
-	ttf-freefont \
-    nodejs \
-    yarn \
+	nodejs \
+	yarn \
 	--no-install-recommends \
 	&& apt-get purge --auto-remove -y curl gnupg \
 	&& rm -rf /var/lib/apt/lists/*

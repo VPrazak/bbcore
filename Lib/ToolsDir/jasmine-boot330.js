@@ -1,3 +1,4 @@
+"use strict";
 (function () {
     var jasmine = jasmineRequire.core(jasmineRequire);
     window["jasmine"] = jasmine;
@@ -5,15 +6,6 @@
     var jasmineInterface = jasmineRequire.interface(jasmine, env);
     for (var property in jasmineInterface)
         window[property] = jasmineInterface[property];
-    var specFilterRegExp = new RegExp(window.parent.specFilter);
-    var config = {
-        failFast: true,
-        oneFailurePerSpec: true,
-        hideDisabled: false,
-        specFilter: function (spec) {
-            return specFilterRegExp.test(spec.getFullName());
-        }
-    };
     function _inspect(arg, within) {
         var result = "";
         if (Object(arg) !== arg) {
@@ -187,6 +179,7 @@
         }
         return result + arr_obj.join(", ") + "\n" + repeatString(_indent, stack_length - 1) + "}";
     }
+    var testId = window.location.hash;
     function realLog(message) {
         var stack;
         var err = new Error();
@@ -199,11 +192,25 @@
                 stack = err.stack || err.stacktrace;
             }
         }
-        bbTest("consoleLog", { message: message, stack: stack });
+        bbTest("consoleLog" + testId, { message: message, stack: stack });
     }
     var bbTest = window.parent.bbTest;
     if (bbTest) {
-        config.failFast = false;
+        var specFilter = window.parent.specFilter;
+        var specFilterFnc = function (_spec) { return true; };
+        if (specFilter) {
+            var specFilterRegExp = new RegExp(specFilter);
+            specFilterFnc = function (spec) { return specFilterRegExp.test(spec.getFullName()); };
+        }
+        var config = {
+            failFast: false,
+            oneFailurePerSpec: true,
+            hideDisabled: false,
+            specFilter: specFilterFnc
+        };
+        onerror = (function (msg, _url, _lineNo, _columnNo, error) {
+            bbTest("onerror" + testId, { message: msg, stack: error.stack });
+        });
         env.configure(config);
         var perfnow;
         if (window.performance) {
@@ -225,23 +232,49 @@
         var totalStart_1 = 0;
         env.addReporter({
             jasmineStarted: function (suiteInfo) {
-                bbTest("wholeStart", suiteInfo.totalSpecsDefined);
+                bbTest("wholeStart" + testId, suiteInfo.totalSpecsDefined);
                 totalStart_1 = perfnow();
             },
             jasmineDone: function () {
-                bbTest("wholeDone", perfnow() - totalStart_1);
+                bbTest("wholeDone" + testId, perfnow() - totalStart_1);
+                var cov = window.__c0v;
+                if (cov != undefined) {
+                    var pos_1 = 0;
+                    var sendPart_1 = function () {
+                        while (pos_1 < cov.length && cov[pos_1] === 0)
+                            pos_1++;
+                        if (pos_1 < cov.length) {
+                            var maxlen = Math.min(cov.length - pos_1, 1024);
+                            var len = maxlen - 1;
+                            while (cov[pos_1 + len] === 0)
+                                len--;
+                            len++;
+                            bbTest("coverageReportPart" + testId, {
+                                start: pos_1,
+                                data: Array.prototype.slice.call(cov.slice(pos_1, pos_1 + len))
+                            });
+                            pos_1 += maxlen;
+                            setTimeout(sendPart_1, 10);
+                        }
+                        else {
+                            bbTest("coverageReportFinished" + testId, { length: cov.length });
+                        }
+                    };
+                    bbTest("coverageReportStarted" + testId, { length: cov.length });
+                    setTimeout(sendPart_1, 10);
+                }
             },
             suiteStarted: function (result) {
-                bbTest("suiteStart", result.description);
+                bbTest("suiteStart" + testId, result.description);
                 stack_1.push(perfnow());
             },
             specStarted: function (result) {
-                bbTest("testStart", { name: result.description, stack: result.stack });
+                bbTest("testStart" + testId, { name: result.description, stack: result.stack });
                 specStart_1 = perfnow();
             },
             specDone: function (result) {
                 var duration = perfnow() - specStart_1;
-                bbTest("testDone", {
+                bbTest("testDone" + testId, {
                     name: result.description,
                     duration: duration,
                     status: result.status,
@@ -250,7 +283,7 @@
             },
             suiteDone: function (result) {
                 var duration = perfnow() - stack_1.pop();
-                bbTest("suiteDone", {
+                bbTest("suiteDone" + testId, {
                     name: result.description,
                     duration: duration,
                     status: result.status,
@@ -332,7 +365,12 @@
         };
     }
     else {
-        config.failFast = true;
+        var config = {
+            failFast: true,
+            oneFailurePerSpec: true,
+            hideDisabled: false,
+            specFilter: function (_spec) { return true; }
+        };
         env.configure(config);
         env.addReporter({
             jasmineStarted: function (suiteInfo) {

@@ -20,6 +20,7 @@ interface IFileForBundle {
     lazyRequires: string[];
     // it is not really TypeScript converted to commonjs
     difficult: boolean;
+    json: boolean;
     shortname?: string;
     // empty string is main bundle
     partOfBundle: "" | string;
@@ -226,32 +227,53 @@ function check(
     if (cached !== undefined) return cached;
 
     let fileContent: string = bb.readContent(name);
+    let jsdeps = bb.getPlainJsDependencies(name).split("|");
+    if (jsdeps.length == 1 && jsdeps[0] == "") jsdeps = [];
+    const cachedName = name.toLowerCase();
+    const isJson = name.endsWith(".json");
+    if (isJson) {
+        let shortname = numberToChars(globalDifficultCounter++);
+        cached = {
+            name,
+            shortname,
+            ast: parse(`__bbe['${shortname}']=${fileContent};`),
+            requires: [],
+            lazyRequires: [],
+            difficult: true,
+            json: true,
+            partOfBundle: requiredAs,
+            selfexports: [],
+            exports: undefined,
+            pureFuncs: Object.create(null),
+            plainJsDependencies: jsdeps
+        };
+        cache[cachedName] = cached;
+        order.push(cached);
+        return cached;
+    }
     //bb.log("============== START " + name);
     //console.log(fileContent);
     let ast = parse(fileContent);
     //console.log(ast.print_to_string({ beautify: true }));
     ast.figure_out_scope!();
-    let jsdeps = bb.getPlainJsDependencies(name).split("|");
-    if (jsdeps.length == 1 && jsdeps[0] == "") jsdeps = [];
     cached = {
         name,
         ast,
         requires: [],
         lazyRequires: [],
         difficult: false,
+        json: false,
         partOfBundle: requiredAs,
         selfexports: [],
         exports: undefined,
         pureFuncs: Object.create(null),
         plainJsDependencies: jsdeps
     };
-    const cachedName = name.toLowerCase();
     cache[cachedName] = cached;
     let pureMatch = fileContent.match(/^\/\/ PureFuncs:.+/gm);
     if (pureMatch) {
         pureMatch.forEach(m => {
-            m
-                .toString()
+            m.toString()
                 .substr(m.indexOf(":") + 1)
                 .split(",")
                 .forEach(s => {
@@ -263,16 +285,12 @@ function check(
     if (ast.globals!.has("module")) {
         cached.difficult = true;
         cached.shortname = numberToChars(globalDifficultCounter++);
-        ast = parse(`(function(){ var exports = {}; var module = { exports: exports }; var global = this; ${bb.readContent(
-            name
-        )}
+        ast = parse(`(function(){ var exports = {}; var module = { exports: exports }; var global = this; ${fileContent}
 __bbe['${cached.shortname}']=module.exports; }).call(window);`);
         cached.ast = ast;
-        cache[name.toLowerCase()] = cached;
         order.push(cached);
         return cached;
     }
-    let exportsSymbol = ast.globals!.get("exports");
     let unshiftToBody: IAstStatement[] = [];
     let selfExpNames = Object.create(null);
     let varDecls: IAstVarDef[] | null = null;
@@ -520,6 +538,9 @@ function captureTopLevelVarsFromTslibSource(bundleAst: IAstToplevel, topLevelNam
             if (key[0] == "_") topLevelNames[key] = true;
         }
     );
+    bundleAst.globals!.each((val, key) => {
+        topLevelNames[key] = true;
+    });
 }
 
 interface ISplitInfo {
@@ -543,7 +564,7 @@ interface ISplitInfo {
 type SplitMap = { [name: string]: ISplitInfo };
 type NamesSet = { [name: string]: true };
 
-var number2Ident = (function () {
+var number2Ident = (function() {
     var leading = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ$_".split("");
     var digits = "0123456789".split("");
     var chars = leading.concat(digits);
@@ -615,11 +636,13 @@ function bundle(project: IBundleProject) {
     });
     if (bundleNames.length > 1) detectBundleExportsImports(order, splitMap, cache, generateIdent);
     for (let bundleIndex = 0; bundleIndex < bundleNames.length; bundleIndex++) {
-        let bundleAst = <IAstToplevel>parse(
-            '(function(undefined){"use strict";\n' +
-            bb.tslibSource(bundleNames.length > 1) +
-            (project.compress === false ? emitGlobalDefines(project.defines) : "") +
-            "})()"
+        let bundleAst = <IAstToplevel>(
+            parse(
+                '(function(undefined){"use strict";\n' +
+                    bb.tslibSource(bundleNames.length > 1) +
+                    (project.compress === false ? emitGlobalDefines(project.defines) : "") +
+                    "})()"
+            )
         );
         let bodyAst = (<IAstFunction>(<IAstCall>(<IAstSimpleStatement>bundleAst.body![0]).body).expression).body!;
         let pureFuncs: NamesSet = Object.create(null);
@@ -734,7 +757,9 @@ function bundle(project: IBundleProject) {
                                         if (asts) {
                                             return renameSymbolWithReplace(asts, splitMap[currentBundleName]);
                                         }
-                                        throw new Error("In " + thedef.bbRequirePath + " cannot find " + extn);
+                                        // This is not error because it could be just TypeScript interface
+                                        // throw new Error("In " + thedef.bbRequirePath + " cannot find " + extn);
+                                        return newSymbolRef("undefined");
                                     }
                                 }
                             }
@@ -943,6 +968,9 @@ function renameGlobalVarsAndBuildPureFuncList(
         if (f.partOfBundle !== currentBundleName) return;
         if (f.difficult) return;
         let suffix = fileNameToIdent(f.name);
+        f.ast.globals!.each((val, key) => {
+            topLevelNames[key] = true;
+        });
         let walker = new TreeWalker((node: IAstNode, descend: () => void) => {
             if (node instanceof AST_Scope) {
                 node.variables!.each((symb, name) => {
@@ -1059,6 +1087,7 @@ function compressAst(
     pureFuncs: { [name: string]: true }
 ): IAstToplevel {
     if (project.compress !== false) {
+        var start = Date.now();
         buildScopesAndLieAboutEval(bundleAst);
         let compressor = Compressor({
             hoist_funs: false,
@@ -1091,17 +1120,19 @@ function compressAst(
             }
         });
         bundleAst = <IAstToplevel>bundleAst.transform!(compressor);
-        // in future to make another pass with removing function calls with empty body
+        bb.log("Compress took " + ((Date.now() - start) * 0.001).toFixed(1) + "s");
     }
     return bundleAst;
 }
 
 function mangleNames(project: IBundleProject, bundleAst: IAstToplevel) {
     if (project.mangle !== false) {
+        var start = Date.now();
         buildScopesAndLieAboutEval(bundleAst);
         base54.reset();
         bundleAst.compute_char_frequency!();
         bundleAst.mangle_names!();
+        bb.log("Mangle took " + ((Date.now() - start) * 0.001).toFixed(1) + "s");
     }
 }
 

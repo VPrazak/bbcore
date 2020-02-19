@@ -1,6 +1,8 @@
 ﻿using System.Collections.Generic;
 using BTDB.ODBLayer;
-using Lib.Utils;
+using Lib.TSCompiler;
+using Njsast.Bobril;
+using Njsast.SourceMap;
 
 namespace Lib.BuildCache
 {
@@ -27,32 +29,15 @@ namespace Lib.BuildCache
         [PrimaryKey(2)]
         public uint ConfigurationId { get; set; }
 
-        public string DtsOutput { get; set; }
-        public string JsOutput { get; set; }
+        public string Output { get; set; }
         public SourceMap MapLink { get; set; }
-        public List<string> ModuleImports { get; set; }
-        public List<byte[]> ModuleImportsHashes { get; set; }
-        public List<string> LocalImports { get; set; }
-        public List<byte[]> LocalImportsHashes { get; set; }
+        public SourceInfo SourceInfo { get; set; }
+        public List<DependencyTriplet> TranspilationDependencies { get; set; } 
     }
 
     public interface ITSFileBuildCacheTable
     {
         bool Upsert(TSFileBuildCache value);
         TSFileBuildCache FindByIdOrDefault(byte[] contentHash, uint configurationId);
-    }
-
-    public class HashedContent
-    {
-        [PrimaryKey(1)]
-        public byte[] ContentHash { get; set; }
-
-        public string Content { get; set; }
-    }
-
-    public interface IHashedContentTable
-    {
-        void Insert(HashedContent value);
-        HashedContent FindByIdOrDefault(byte[] contentHash);
     }
 }

@@ -2,6 +2,622 @@
 
 ## [unreleased]
 
+### Changed
+
+Undefined `process.env.XXX` is now replaced by `unknown` instead of left as is.
+
+## 1.11.1
+
+### Fixed
+
+- Wrong renaming in new bundler
+
+## 1.11.0
+
+### Added
+
+- Coverage (unfinished, disabled by default)
+
+### Fixed
+
+- Wrong code generated in new bundler for nested export usage before declaration.
+- Autorestart headless chrome if stopped responding.
+
+## 1.10.1
+
+### Fixed
+
+- Fix export another shadowing global bug in just in new bundler.
+
+## 1.10.0
+
+### Changed
+
+- New bundler is now default.
+
+### Fixed
+
+- Wrong splitting of long lines in minification in new bundler.
+- Fix export shadowing global in both bundlers.
+
+## 1.9.3
+
+### Fixed
+
+- Another bug squashed in bundler (unneeded brackets)
+- IE11 fast bundler compatibility with module.exports = location
+
+## 1.9.2
+
+### Fixed
+
+- Another bugs squashed in bundler (missing parentis)
+
+## 1.9.1
+
+### Fixed
+
+- Another bugs squashed in bundler (`this` is not undefined and hex numbers bigger than 32bit)
+
+## 1.9.0
+
+### Changed
+
+- By default enable `allowSyntheticDefaultImports`
+
+### Fixed
+
+- Minification in new bundler for Quill library.
+
+## 1.8.0
+
+### Added
+
+- Option to proxy all unknown requests to project defined url including websockets (`"proxyUrl": "http://localhost:3001"` in `bobril` section in `package.json`)
+- Chrome on Linux could be installed by Snap
+
+## 1.7.0
+
+### Added
+
+- Option to force use new bundler (`"forceNewBundler": true` in `bobril` section in `package.json`)
+- Many fixes and small features to be able to bundle `socket.io-client` npm module (only fast and new bundler works)
+
+## 1.6.0
+
+### Changed
+
+- Default TypeScript version is 3.7.4
+
+### Added
+
+- Option to disable calculation of common project root (`"preserveProjectRoot": true` in `bobril` section in `package.json`)
+
+## 1.5.1
+
+### Fixed
+
+- Reimplemented -5 error with not constant `b.asset` parameter.
+- Fixed crash with immutable.js `this(x)`
+
+## 1.5.0
+
+### Added
+
+- All bundlers does not use inline script in html anymore, so it allows stricter CSP policy.
+
+### Fixed
+
+- Spritting was broken in fast bundler
+
+## 1.4.1
+
+### Fixed
+
+- Many regressions from 1.3 and 1.4 versions.
+
+## 1.4.0
+
+### Added
+
+- All module \*.js imports are now compiled and detected for dependencies.
+- Support for `browser` in `package.json` by [spec](https://github.com/defunctzombie/package-browser-field-spec)
+  - Additionally if you define `"browser" : { "module_name": "module_name/dist/bundle.js" }` it override main js file for module imported by its name.
+- Njsast based bundler supports bundling of `module.exports =` commonjs pattern. For example it is capable of bundling `sockjs-client` as is.
+- `process.env.X` replacement works in js files too.
+
+## 1.3.0
+
+### Added
+
+- All relative and deep \*.js imports are now compiled and detected for dependencies.
+
+### Changed
+
+- Special handling of @stomp/stompjs updated to version 5+
+
+## 1.2.0
+
+### Added
+
+- Support for ServiceWorkers/PWA and WebWorkers
+  - `b.asset` support new `project:` prefix which needs to be followed by relative directory path with `project.json`
+  - target project must have defined `"bobril": { "variant": "worker" }` or `"bobril": { "variant": "serviceworker" }`
+  - service worker automatically defines `swBuildDate` (contains date of build in string), `swBuildId` (contains obfuscated date of build in string), `swFiles` (array with all files in compilation)
+  - example in `TestProjects/PWA/main`
+
+```ts
+import * as b from "bobril";
+import * as Comlink from "comlink";
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register(b.asset("project:../sw")).then(function() {
+    console.log("Service Worker Registered");
+  });
+}
+
+var obj = Comlink.wrap(
+  new Worker(b.asset("project:../worker"))
+)};
+```
+
+## 1.1.0
+
+### Added
+
+- Support for TSX translation with bobril-g11n 5.0
+
+```tsx
+<g.T hint="hint for translator" param="parameter">
+  Normal text{" "}
+  <b>
+    bold text{" "}
+    <i>
+      <u>with</u>
+    </i>{" "}
+    {g.t("{param}")}
+  </b>
+</g.T>
+```
+
+## 1.0.0
+
+### Changed
+
+- Testing iframe in `bb/test` page covers 100% of main window now.
+
+## 0.99.0
+
+### Added
+
+- Support for bobril-g11n 5.0 translation of virtual dom messages (full TSX support will come later)
+
+```tsx
+g.t("Before{1/}After", { 1: () => <hr /> });
+g.t("Normal text {1}bold text {2}with{/2} {param}{/1}", {
+  1: (p: b.IBobrilChildren) => <b>{p}</b>,
+  2: (p: b.IBobrilChildren) => (
+    <i>
+      <u>{p}</u>
+    </i>
+  ),
+  param: "parameter"
+});
+```
+
+- Fixes and speed up of Njsast based compression and mangling.
+
+## 0.98.0
+
+### Added
+
+- New bundler from Njsast purely in C#. Currently not enabled by default, but could enabled by adding `bb b -x 1`. New bundler allows to generate source map, enable by `-g yes`. Using `--sourceRoot ".."` define what should be written in source map sourceRoot field, default is `..` which nicely works with default `dist` output directory.
+
+## 0.97.1
+
+### Fixed
+
+- regression from 0.97.0 in DEBUG constant.
+
+## 0.97.0
+
+### Changed
+
+- Default TypeScript version is 3.7.2
+
+### Added
+
+- Support for `process.env.X` constants which are replaced during compilation by some constant. They don't directly read system environment, what whey do must be specified in `package.json` by JavaScript expression. There is default definition for `NODE_ENV` to be `DEBUG?"development":"production"` like in React/Node apps.
+
+- You can define global constants also using `package.json`. Till now there was only `DEBUG` which has default definition to be equal to build-in `DEBUG`.
+
+- In these definition you can use build-in `env` object which allows to get value of environmental variable. See examples in README.
+
+- Interactive mode could now correctly watch for changes in Docker. There is also new BBWATCHER environmental variable to control responsiveness of such watcher. See README for details.
+
+## 0.96.3
+
+### Fixed
+
+- TypeScript emulation of array spread improved so that it works also Bobx observable arrays on IE11.
+
+## 0.96.2
+
+### Fixed
+
+- Prefer .ts(x) over .d.ts (should solve problem with Bobril 13)
+
+## 0.96.1
+
+### Fixed
+
+- Correct counting of skipped tests with focused tests and Jasmine 3.3
+
+## 0.96.0
+
+### Changed
+
+- Default TypeScript version is 3.6.4
+
+### Added
+
+- Enabled Generators in default configuration.
+
+## 0.95.2
+
+### Fixed
+
+Special casing `@stomp/stompjs` to use `lib/stomp.js` as main file instead of `index.js`.
+
+## 0.95.1
+
+### Fixed
+
+Loader.js had to be also updated to support namespace modules.
+Css @import's are moved to beginning of bundled css.
+
+## 0.95.0
+
+### Added
+
+Support for modules in namespace like @stomp/stompjs
+
+### Fixed
+
+Build mode now sorts multiple css files for bundling in same way as interactive mode.
+
+## 0.94.0
+
+### Added
+
+- support for `__spreadArrays` from tslib.
+
+## 0.93.0
+
+### Added
+
+- allow to define default build path in `package.json`/`bobril`/`buildOutputDir` (default is `./dist`)
+
+## 0.92.1
+
+### Fixed
+
+- Build must show same configuration errors like interactive build.
+- Attempt to make watch change detection to more reliable.
+
+## 0.92.0
+
+### Added
+
+- Test onerror handler to catch errors outside of suites.
+
+## 0.91.4
+
+### Fixed
+
+- js and css files in html head are treated like resources (not touched just copied to output dir).
+- patch TypeScript 3.6.2 bug https://github.com/microsoft/TypeScript/issues/33142
+
+## 0.91.3
+
+### Fixed
+
+- Special case lenticular-ts npm to not expect already bundled js in main and enable bundling.
+- Fix to ignore package.json typescript.main when it does not exist.
+- Maybe crash when renaming file.
+- Removed "use strict" from loader.js, so now it is again not in strict mode from start.
+
+## 0.91.2
+
+### Fixed
+
+- Infinite compile cycle when started in directory with .git
+
+## 0.91.1
+
+### Fixed
+
+- IncludeSources were not included in `bb test`.
+
+## 0.91.0
+
+### Changed
+
+- Default TypeScript version is 3.5.3
+
+### Fixed
+
+- Crash in special errors in tests in Jasmine 3.3
+- Detect expression name with code like `export const name = b.styleDef()`
+
+## 0.90.0
+
+### Added
+
+- Paths to files in console are now absolute
+
+### Fixed
+
+- Crash with parsing jasmine timeout stack
+- Fix assets generation
+- Sprites images should not be in dist
+
+## 0.89.0
+
+### Added
+
+- Nice error message when import is missing
+
+### Fixed
+
+- sprite.ts generation
+- fix regression from 0.88.0 with cache
+
+## 0.88.0
+
+### Fixed
+
+- Missing index.html in `bb b -f 1`
+- Cache now includes relative file names for assets and sprites
+- Print global semantic errors and make build failed in such case
+
+## 0.87.0
+
+### Change In Default
+
+- Jasmine 3.3 is now default version instead of old 2.99 version.
+
+### Fixed
+
+- Json import now works in IE11. Also supports arrays in root.
+
+## 0.86.4
+
+### Fixed
+
+- Sourcemap search didn't work for last span at line
+
+## 0.86.3
+
+### Fixed
+
+- Fixed bundler to ignore reexporting interface by name.
+- Missing import should be error and not warning
+
+## 0.86.2
+
+### Fixed
+
+- Semantic check missed IncludeSources. Also fixed one thread safe issue with displaing errors.
+
+## 0.86.1
+
+### Fixed
+
+- Better error message when sprite is not image.
+- using do while could throw exception
+
+## 0.86.0
+
+### Added
+
+- masively speed up builds (type checking runs in parallel and is relatively slow), incremental builds even more...
+
+### Temporary Removed
+
+- detection of missing imports and spare dependencies
+
+## 0.85.0
+
+### Changed
+
+- Print original path in console messages relative to common root (that's behaviour change, but fixes also regression on focusing compilation errors from 0.83.1). Open original path in VSCode.
+
+## 0.84.0
+
+## 0.83.2
+
+### Added
+
+- allowing to disable update of tsconfig.json
+
+## 0.83.1
+
+### Fixed
+
+- Fixed focusing error in VSCode when common source root is not project root.
+
+## 0.83.0
+
+### Added
+
+- allowing to override autodetection of localization from package.json. And define directory for translations.
+
+### Fixed
+
+- added workaround fix which should resolve pending status when loading resources in Chrome 75 running in Docker
+- global help also lists all commands.
+
+## 0.82.3
+
+### Fixed
+
+- Missing import from d.ts should be silently skipped.
+
+## 0.82.2
+
+### Fixed
+
+- assets can now define target dir as empty without crash
+- recompilation in interactive mode in some cases missed to include some modules to bundle
+
+## 0.82.1
+
+### Fixed
+
+- Don't show missing dependency from files which are in node_module directory.
+
+## 0.82.0
+
+### Added
+
+- Package.json bobril section `testDirectories` can define array of relative paths to search test files
+
+### Fixed
+
+- Minor crashes
+
+## 0.81.1
+
+### Fixed
+
+- Crash when exists d.ts file together with ts(x) file.
+
+## 0.81.0
+
+### Changed
+
+- Default TypeScript version is 3.4.5
+
+### Added
+
+- b.asset now forces external resource handling when parameter is prefixed by `resource:` like:
+
+```ts
+console.log(b.asset("resource:./src/file.js")); // depending on mode prints "src/file.js" or "b.js"
+```
+
+- b.asset("node_modules/x") now also search parent node_modules directories
+
+### Fixed
+
+- Asset resolving now correctly relative to common build directory and not to project directory
+
+## 0.80.0
+
+### Added
+
+- Support for importing css files.
+- Support for esm modules. (means importing monaco-editor "works")
+
+### Fixed
+
+- Allow to use template strings.
+
+## 0.79.2
+
+### Fixed
+
+- Allow to read @types higher than is project root.
+
+## 0.79.1
+
+### Fixed
+
+- Regression in importing d.ts with js.
+- Don't print unused dependencies when build has errors.
+
+## 0.79.0
+
+### Changed
+
+- Free memory after each interactive build.
+
+## 0.78.2
+
+### Fixed
+
+- Relative module imports from 0.78.0 truly works with more complex project.
+
+## 0.78.1
+
+### Fixed
+
+- Relative module imports from 0.78.0 works with more complex project.
+
+## 0.78.0
+
+### Added
+
+- Allow to disable Error -10 which forbids relative imports into modules.
+
+## 0.77.0
+
+### Changed
+
+- Default TypeScript version is 3.4.1
+
+### Fixed
+
+- Added DisableFatalOnOOM = true to ChakraCore settings.
+
+## 0.76.0
+
+### Added
+
+- BBCACHEDIR environmental variable allows to override .bbcache directory placement.
+- Errors in tests between them are now correctly displayed and reported.
+
+### Changed
+
+- Test sources are now sorted (imported in same order in test.html on all platforms).
+
+### Fixed
+
+- Don't crash at Quill
+
+## 0.75.0
+
+### Improved
+
+- Updated to .NetCore 2.2. Updated all dependencies.
+
+## 0.74.0
+
+### Improved
+
+- Decreased memory consumption of Build and Test command. Test command with -d parameter does not run tests just create output.
+- Updated ChakraCore dependency.
+
+### Fixed
+
+- Module resolver now first search in project root and then continue with classic node resolver.
+
+## 0.73.0
+
+### Added
+
+- Log more details about testing in verbose mode.
+
+### Changed
+
+- Module Resolver changed to be more similar to node.
+- Modification Watcher should use less resources (Big projects on Mac should work now)
+
+### Fixed
+
+- Filter test parameter works better when empty.
+
 ## 0.72.2
 
 ### Fixed

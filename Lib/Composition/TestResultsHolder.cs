@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Xml;
+using Newtonsoft.Json;
 
 namespace Lib.Composition
 {
@@ -11,6 +12,9 @@ namespace Lib.Composition
     {
         public string UserAgent;
         public bool Running;
+        [JsonIgnore]
+        public uint[]? CoverageData;
+        public int SuitesFailed;
         public int TestsFailed;
         public int TestsSkipped;
         public int TestsFinished;
@@ -35,12 +39,27 @@ namespace Lib.Composition
                 TestsFailed = TestsFailed,
                 TestsFinished = TestsFinished,
                 TestsSkipped = TestsSkipped,
-                TotalTests = TotalTests
+                TotalTests = TotalTests,
+                CoverageData = CoverageData
             };
         }
 
         static void WriteJUnitSystemOut(XmlWriter w, SuiteOrTest test)
         {
+            if (test.Skipped)
+            {
+                w.WriteStartElement("skipped");
+                w.WriteEndElement();
+            }
+            else if (test.Failure)
+            {
+                test.Failures.ForEach(fail =>
+                {
+                    w.WriteStartElement("failure");
+                    w.WriteAttributeString("message", fail.Message + "\n" + string.Join("\n", fail.Stack));
+                    w.WriteEndElement();
+                });
+            }
             if (test.Logs == null || test.Logs.Count == 0)
                 return;
             w.WriteStartElement("system-out");
@@ -61,20 +80,6 @@ namespace Lib.Composition
                 w.WriteStartElement("testcase");
                 w.WriteAttributeString("name", test.Name);
                 w.WriteAttributeString("time", (test.Duration * 0.001).ToString("F4", CultureInfo.InvariantCulture));
-                if (test.Skipped)
-                {
-                    w.WriteStartElement("skipped");
-                    w.WriteEndElement();
-                }
-                else if (test.Failure)
-                {
-                    test.Failures.ForEach(fail =>
-                    {
-                        w.WriteStartElement("failure");
-                        w.WriteAttributeString("message", fail.Message + "\n" + string.Join("\n", fail.Stack));
-                        w.WriteEndElement();
-                    });
-                }
                 WriteJUnitSystemOut(w, test);
                 w.WriteEndElement();
             });
@@ -148,11 +153,12 @@ namespace Lib.Composition
             var w = new XmlTextWriter(sw);
             w.WriteStartDocument();
             w.WriteStartElement("testsuites");
-            w.WriteAttributeString("errors", "0");
+            w.WriteAttributeString("errors", "" + SuitesFailed);
             w.WriteAttributeString("failures", "" + TestsFailed);
             w.WriteAttributeString("tests", "" + TotalTests);
             w.WriteAttributeString("time", (Duration * 0.001).ToString("F4", CultureInfo.InvariantCulture));
             RecursiveWriteJUnit(w, this, "", flatTestSuites);
+            WriteJUnitSystemOut(w, this);
             w.WriteEndElement();
             w.WriteEndDocument();
             return sw.ToString();

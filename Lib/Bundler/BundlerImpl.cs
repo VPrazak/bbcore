@@ -4,21 +4,23 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 using System;
 using System.Collections.Generic;
-using System.Text;
 
 namespace Lib.Bundler
 {
+    /// <summary>
+    /// Old Bundler implemented in JavaScript - uses UglifyJs for compression and minification
+    /// </summary>
     public class BundlerImpl : IBundler
     {
         readonly IToolsDir _toolsDir;
         readonly BBCallbacks _bbCallbacks;
 
-        public IReadOnlyList<string> MainFiles { get; set; }
+        public IReadOnlyList<string>? MainFiles { get; set; }
         public bool Compress { get; set; }
         public bool Mangle { get; set; }
         public bool Beautify { get; set; }
         public IReadOnlyDictionary<string, object> Defines { get; set; }
-        public IBundlerCallback Callbacks { get; set; }
+        public IBundlerCallback? Callbacks { get; set; }
 
         public BundlerImpl(IToolsDir toolsDir)
         {

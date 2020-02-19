@@ -1,5 +1,5 @@
-import 'bobril'; // For Promise polyfill
-import * as g from 'bobril-g11n';
+import "bobril"; // For Promise polyfill
+import * as g from "bobril-g11n";
 
 describe("Demo suite", () => {
     it("works", () => {

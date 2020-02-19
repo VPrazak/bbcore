@@ -14,17 +14,25 @@ using Lib.Utils.CommandLineParser.Definitions;
 using Lib.Utils.CommandLineParser.Parser;
 using System.Globalization;
 using System.Linq;
+using System.Net.Http;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 using Lib.Chrome;
 using System.Reflection;
 using System.Text;
 using System.Reactive;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using BTDB.Collections;
 using Lib.BuildCache;
 using Lib.Registry;
 using Lib.Utils.Notification;
 using Lib.Translation;
 using Lib.Utils.Logger;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Njsast.Reader;
+using ProxyKit;
 
 namespace Lib.Composition
 {
@@ -35,11 +43,10 @@ namespace Lib.Composition
         ToolsDir.IToolsDir _tools;
         DiskCache.DiskCache _dc;
         CompilerPool _compilerPool;
-        object _projectsLock = new object();
-        List<ProjectOptions> _projects = new List<ProjectOptions>();
         WebServerHost _webServer;
         AutoResetEvent _hasBuildWork = new AutoResetEvent(true);
         ProjectOptions _currentProject;
+        MainBuildResult _mainBuildResult;
         CommandLineCommand _command;
         TestServer _testServer;
         ILongPollingServer _testServerLongPollingHandler;
@@ -86,7 +93,11 @@ namespace Lib.Composition
             if (_command is CommonParametersBaseCommand commonParams)
             {
                 if (commonParams.Verbose.Value)
+                {
                     _verbose = true;
+                    _logger.Verbose = true;
+                }
+
                 if (commonParams.NoBuildCache.Value)
                     _buildCache = new DummyBuildCache();
                 else
@@ -136,7 +147,7 @@ namespace Lib.Composition
         void RunPackageAdd(PackageManagerAddCommand addCommand)
         {
             InitDiskCache();
-            var project = AddProject(PathUtils.Normalize(Environment.CurrentDirectory), false);
+            var project = SetMainProject(PathUtils.Normalize(Environment.CurrentDirectory));
             var currentNodePackageManager = new CurrentNodePackageManager(_dc, _logger);
             if (addCommand.PackageName.Value == null)
             {
@@ -151,7 +162,7 @@ namespace Lib.Composition
         void RunPackageUpgrade(PackageManagerUpgradeCommand upgradeCommand)
         {
             InitDiskCache();
-            var project = AddProject(PathUtils.Normalize(Environment.CurrentDirectory), false);
+            var project = SetMainProject(PathUtils.Normalize(Environment.CurrentDirectory));
             var currentNodePackageManager = new CurrentNodePackageManager(_dc, _logger);
             var before = currentNodePackageManager.GetLockedDependencies(project.Owner.Owner).ToArray();
             if (upgradeCommand.PackageName.Value == null)
@@ -187,14 +198,14 @@ namespace Lib.Composition
         void RunPackageInstall(PackageManagerInstallCommand installCommand)
         {
             InitDiskCache();
-            var project = AddProject(PathUtils.Normalize(Environment.CurrentDirectory), false);
+            var project = SetMainProject(PathUtils.Normalize(Environment.CurrentDirectory));
             new CurrentNodePackageManager(_dc, _logger).Install(project.Owner.Owner);
         }
 
         void RunTranslation(TranslationCommand tCommand)
         {
             InitDiskCache();
-            var project = AddProject(PathUtils.Normalize(Environment.CurrentDirectory), false);
+            var project = SetMainProject(PathUtils.Normalize(Environment.CurrentDirectory));
             TranslationDb trDb;
             var addLanguage = tCommand.AddLang.Value;
             if (addLanguage != null)
@@ -357,7 +368,7 @@ namespace Lib.Composition
         {
             if (!_verbose)
                 return;
-            _logger.WriteLine("Verbose output enabled");
+            _logger.Info("Verbose output enabled");
             AppDomain.CurrentDomain.FirstChanceException += CurrentDomain_FirstChanceException;
         }
 
@@ -367,139 +378,146 @@ namespace Lib.Composition
             string s = e.Exception.ToString();
             if (s.Contains("KestrelConnectionReset"))
                 return;
-            _logger.WriteLine("First chance exception: " + s);
+            _logger.Info("First chance exception: " + s);
         }
 
         void RunBuild(BuildCommand bCommand)
         {
             InitDiskCache();
-            AddProject(PathUtils.Normalize(Environment.CurrentDirectory), bCommand.Sprite.Value);
+            _mainBuildResult = new MainBuildResult(!bCommand.Fast.Value, bCommand.VersionDir.Value);
+            var proj = SetMainProject(PathUtils.Normalize(Environment.CurrentDirectory));
+            proj.SpriteGeneration = bCommand.Sprite.Value;
             _forbiddenDependencyUpdate = bCommand.NoUpdate.Value;
-            DateTime start = DateTime.UtcNow;
-            int errors = 0;
-            int warnings = 0;
-            var messages = new List<CompilationResultMessage>();
-            var messagesFromFiles = new HashSet<string>();
-            var totalFiles = 0;
-            foreach (var proj in _projects)
+            var start = DateTime.UtcNow;
+            var errors = 0;
+            var warnings = 0;
+            var messages = new List<Diagnostic>();
+            try
             {
-                try
+                _logger.WriteLine("Build started " + proj.Owner.Owner.FullPath, ConsoleColor.Blue);
+                proj.UpdateFromProjectJson(bCommand.Localize.Value);
+                proj.StyleDefNaming =
+                    ParseStyleDefNaming(bCommand.Style.Value ?? (bCommand.Fast.Value ? "2" : "0"));
+                proj.Debug = bCommand.Fast.Value;
+                var buildResult = new BuildResult(_mainBuildResult, proj);
+                proj.GenerateCode();
+                proj.SpriterInitialization(_mainBuildResult);
+                proj.RefreshCompilerOptions();
+                proj.RefreshMainFile();
+                proj.RefreshExampleSources();
+                var ctx = new BuildCtx(_compilerPool, _dc, _verbose, _logger, proj.Owner.Owner.FullPath);
+                ctx.Build(proj, true, buildResult, _mainBuildResult, 1);
+                ctx.BuildSubProjects(proj, true, buildResult, _mainBuildResult, 1);
+                _compilerPool.FreeMemory().GetAwaiter();
+                proj.FillOutputByAdditionalResourcesDirectory(buildResult.Modules, _mainBuildResult);
+                IncludeMessages(proj, buildResult, ref errors, ref warnings, messages);
+                if (errors == 0)
                 {
-                    _logger.WriteLine("Build started " + proj.Owner.Owner.FullPath, ConsoleColor.Blue);
-                    proj.Owner.LoadProjectJson(_forbiddenDependencyUpdate);
-                    if (bCommand.Localize.Value != null)
-                        proj.Localize = bCommand.Localize.Value ?? false;
-                    proj.Owner.InitializeOnce();
-                    proj.OutputSubDir = bCommand.VersionDir.Value;
-                    proj.CompressFileNames = !bCommand.Fast.Value;
-                    proj.StyleDefNaming =
-                        ParseStyleDefNaming(bCommand.Style.Value ?? (bCommand.Fast.Value ? "2" : "0"));
-                    proj.BundleCss = !bCommand.Fast.Value;
-                    proj.Defines["DEBUG"] = bCommand.Fast.Value;
-                    proj.GenerateCode();
-                    proj.SpriterInitialization();
-                    proj.RefreshMainFile();
-                    proj.DetectBobrilJsxDts();
-                    proj.RefreshExampleSources();
-                    var ctx = new BuildCtx(_compilerPool, _verbose, ShowTsVersion);
-                    ctx.TSCompilerOptions = proj.GetDefaultTSCompilerOptions();
-                    ctx.Sources = new HashSet<string>();
-                    ctx.Sources.Add(proj.MainFile);
-                    proj.ExampleSources.ForEach(s => ctx.Sources.Add(s));
-                    if (proj.BobrilJsxDts != null)
-                        ctx.Sources.Add(proj.BobrilJsxDts);
-                    proj.Owner.Build(ctx);
-                    var buildResult = ctx.BuildResult;
-                    var filesContent = new Dictionary<string, object>();
-                    proj.FillOutputByAdditionalResourcesDirectory(filesContent, buildResult.Modules);
-                    IncludeMessages(proj, buildResult, ref errors, ref warnings, messages, messagesFromFiles,
-                        proj.Owner.Owner.FullPath);
-                    if (errors == 0)
+                    if (proj.Localize && bCommand.UpdateTranslations.Value)
                     {
-                        if (proj.Localize && bCommand.UpdateTranslations.Value)
+                        // Side effect of fastBundle is registering of all messages
+                        var fastBundle = new FastBundleBundler(_tools, _mainBuildResult, proj, buildResult);
+                        fastBundle.Build("bb/base");
+                        proj.TranslationDb.SaveLangDbs(PathToTranslations(proj), true);
+                        buildResult.TaskForSemanticCheck.Wait();
+                    }
+                    else
+                    {
+                        if (bCommand.Fast.Value)
                         {
-                            proj.TranslationDb.SaveLangDbs(PathToTranslations(proj), true);
+                            var fastBundle = new FastBundleBundler(_tools, _mainBuildResult, proj, buildResult);
+                            fastBundle.Build("bb/base");
+                            fastBundle.BuildHtml();
                         }
                         else
                         {
-                            if (bCommand.Fast.Value)
-                            {
-                                var fastBundle = new FastBundleBundler(_tools);
-                                fastBundle.FilesContent = filesContent;
-                                fastBundle.Project = proj;
-                                fastBundle.BuildResult = buildResult;
-                                fastBundle.Build("bb/base", "bundle.js.map");
-                            }
-                            else
-                            {
-                                var bundle = new BundleBundler(_tools);
-                                bundle.FilesContent = filesContent;
-                                bundle.Project = proj;
-                                bundle.BuildResult = buildResult;
-                                bundle.Build(bCommand.Compress.Value, bCommand.Mangle.Value, bCommand.Beautify.Value);
-                            }
+                            var bundle = bCommand.NewBundler.Value
+                                ? (IBundler) new NjsastBundleBundler(_tools, _logger, _mainBuildResult, proj,
+                                    buildResult)
+                                : new BundleBundler(_tools, _mainBuildResult, proj, buildResult);
+                            bundle.Build(bCommand.Compress.Value, bCommand.Mangle.Value, bCommand.Beautify.Value,
+                                bCommand.SourceMap.Value == "yes", bCommand.SourceMapRoot.Value);
+                        }
 
-                            SaveFilesContentToDisk(filesContent, bCommand.Dir.Value);
-                            totalFiles += filesContent.Count;
+                        buildResult.TaskForSemanticCheck.ContinueWith(semanticDiag =>
+                        {
+                            if (semanticDiag.IsCompletedSuccessfully)
+                                messages = IncludeSemanticMessages(proj, semanticDiag.Result, ref errors, ref warnings,
+                                    messages);
+                        }).Wait();
+
+                        if (errors == 0)
+                        {
+                            SaveFilesContentToDisk(_mainBuildResult.FilesContent,
+                                PathUtils.Join(proj.Owner.Owner.FullPath,
+                                    bCommand.Dir.Value ?? proj.BuildOutputDir ?? "./dist"));
                         }
                     }
                 }
-                catch (Exception ex)
-                {
-                    _logger.Error("Fatal Error: " + ex);
-                    errors++;
-                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Fatal Error: " + ex);
+                errors++;
             }
 
             var duration = DateTime.UtcNow - start;
             PrintMessages(messages);
             var color = errors != 0 ? ConsoleColor.Red : warnings != 0 ? ConsoleColor.Yellow : ConsoleColor.Green;
             _logger.WriteLine(
-                $"Build done in {duration.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture)}s with {Plural(errors, "error")} and {Plural(warnings, "warning")} and has {Plural(totalFiles, "file")}",
+                $"Build done in {duration.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture)}s with {Plural(errors, "error")} and {Plural(warnings, "warning")} and has {Plural(_mainBuildResult.FilesContent.Count, "file")}",
                 color);
 
             Environment.ExitCode = errors != 0 ? 1 : 0;
         }
 
-        void PrintMessages(IList<CompilationResultMessage> messages)
+        void PrintMessages(IList<Diagnostic> messages, bool onlySemantic = false)
         {
             foreach (var message in messages)
             {
-                if (message.IsError)
+                if (onlySemantic && !message.IsSemantic) continue;
+                if (message.FileName == null)
                 {
-                    _logger.Error(
-                        $"{message.FileName}({(message.Pos[0])},{(message.Pos[1])}): {message.Text} ({message.Code})");
+                    if (message.IsError)
+                    {
+                        _logger.Error(
+                            $"Error: {message.Text} ({message.Code})");
+                    }
+                    else
+                    {
+                        _logger.Warn(
+                            $"Warning: {message.Text} ({message.Code})");
+                    }
                 }
                 else
                 {
-                    _logger.Warn(
-                        $"{message.FileName}({(message.Pos[0])},{(message.Pos[1])}): {message.Text} ({message.Code})");
+                    if (message.IsError)
+                    {
+                        _logger.Error(
+                            $"{message.FileName}({message.StartLine + 1},{message.StartCol + 1}): {message.Text} ({message.Code})");
+                    }
+                    else
+                    {
+                        _logger.Warn(
+                            $"{message.FileName}({message.StartLine + 1},{message.StartCol + 1}): {message.Text} ({message.Code})");
+                    }
                 }
-            }
-        }
-
-        string _lastTsVersion = null;
-
-        void ShowTsVersion(string version)
-        {
-            if (_lastTsVersion != version)
-            {
-                _logger.WriteLine("Using TypeScript version " + version);
-                _lastTsVersion = version;
             }
         }
 
         static string PathToTranslations(ProjectOptions proj)
         {
-            return PathUtils.Join(proj.Owner.Owner.FullPath, "translations");
+            return PathUtils.Join(proj.Owner.Owner.FullPath, proj.PathToTranslations ?? "translations");
         }
 
         void RunTest(TestCommand testCommand)
         {
             InitDiskCache();
+            _mainBuildResult = new MainBuildResult(false, null);
             InitTestServer();
             InitMainServer();
-            AddProject(PathUtils.Normalize(Environment.CurrentDirectory), testCommand.Sprite.Value);
+            var proj = SetMainProject(PathUtils.Normalize(Environment.CurrentDirectory));
+            proj.SpriteGeneration = testCommand.Sprite.Value;
             int port = 0;
             if (int.TryParse(testCommand.Port.Value, out var portInInt))
             {
@@ -507,61 +525,52 @@ namespace Lib.Composition
             }
 
             StartWebServer(port, false);
-            DateTime start = DateTime.UtcNow;
+            var start = DateTime.UtcNow;
             int errors = 0;
             int testFailures = 0;
             int warnings = 0;
-            var messages = new List<CompilationResultMessage>();
-            var messagesFromFiles = new HashSet<string>();
+            var messages = new List<Diagnostic>();
             var totalFiles = 0;
-            foreach (var proj in _projects)
+            try
             {
-                try
+                _logger.WriteLine("Test build started " + proj.Owner.Owner.FullPath, ConsoleColor.Blue);
+                var testResults = new TestResultsHolder();
+                proj.UpdateFromProjectJson(testCommand.Localize.Value);
+                proj.StyleDefNaming = StyleDefNamingStyle.AddNames;
+                var testBuildResult = new BuildResult(_mainBuildResult, proj);
+                proj.GenerateCode();
+                proj.RefreshCompilerOptions();
+                proj.RefreshTestSources();
+                proj.SpriterInitialization(_mainBuildResult);
+                if (proj.TestSources != null && proj.TestSources.Count > 0)
                 {
-                    _logger.WriteLine("Test build started " + proj.Owner.Owner.FullPath, ConsoleColor.Blue);
-                    TestResultsHolder testResults = new TestResultsHolder();
-                    proj.Owner.LoadProjectJson(true);
-                    if (testCommand.Localize.Value != null)
-                        proj.Localize = testCommand.Localize.Value ?? false;
-                    proj.Owner.InitializeOnce();
-                    proj.StyleDefNaming = StyleDefNamingStyle.AddNames;
-                    proj.GenerateCode();
-                    proj.SpriterInitialization();
-                    proj.RefreshMainFile();
-                    proj.DetectBobrilJsxDts();
-                    proj.RefreshTestSources();
-                    if (proj.TestSources != null && proj.TestSources.Count > 0)
+                    var ctx = new BuildCtx(_compilerPool, _dc, _verbose, _logger, proj.Owner.Owner.FullPath);
+                    ctx.Build(proj, true, testBuildResult, _mainBuildResult, 1);
+                    ctx.BuildSubProjects(proj, true, testBuildResult, _mainBuildResult, 1);
+                    var fastBundle = new FastBundleBundler(_tools, _mainBuildResult, proj, testBuildResult);
+                    proj.FillOutputByAdditionalResourcesDirectory(testBuildResult.Modules, _mainBuildResult);
+                    fastBundle.Build("bb/base", true);
+                    fastBundle.BuildHtml(true);
+                    _compilerPool.FreeMemory().GetAwaiter();
+                    if (testCommand.Dir.Value != null)
+                        SaveFilesContentToDisk(_mainBuildResult.FilesContent, testCommand.Dir.Value);
+                    IncludeMessages(proj, testBuildResult, ref errors, ref warnings, messages);
+                    testBuildResult.TaskForSemanticCheck.ContinueWith(semanticDiag =>
                     {
-                        var ctx = new BuildCtx(_compilerPool, _verbose, ShowTsVersion);
-                        ctx.TSCompilerOptions = proj.GetDefaultTSCompilerOptions();
-                        ctx.Sources = new HashSet<string>();
-                        ctx.Sources.Add(proj.JasmineDts);
-                        proj.TestSources.ForEach(s => ctx.Sources.Add(s));
-                        if (proj.BobrilJsxDts != null)
-                            ctx.Sources.Add(proj.BobrilJsxDts);
-                        proj.Owner.Build(ctx);
-                        var testBuildResult = ctx.BuildResult;
-                        var fastBundle = new FastBundleBundler(_tools);
-                        var filesContent = new Dictionary<string, object>();
-                        proj.FillOutputByAdditionalResourcesDirectory(filesContent, testBuildResult.Modules);
-                        fastBundle.FilesContent = filesContent;
-                        fastBundle.Project = proj;
-                        fastBundle.BuildResult = testBuildResult;
-                        fastBundle.Build("bb/base", "testbundle.js.map", true);
-                        proj.TestProjFastBundle = fastBundle;
-                        proj.FilesContent = filesContent;
-                        if (testCommand.Dir.Value != null)
-                            SaveFilesContentToDisk(filesContent, testCommand.Dir.Value);
-                        IncludeMessages(proj, proj.TestProjFastBundle, ref errors, ref warnings, messages,
-                            messagesFromFiles,
-                            proj.Owner.Owner.FullPath);
-                        PrintMessages(messages);
+                        if (semanticDiag.IsCompletedSuccessfully)
+                            messages = IncludeSemanticMessages(proj, semanticDiag.Result, ref errors, ref warnings,
+                                messages);
+                    }).Wait();
+                    PrintMessages(messages);
+                    if (testCommand.Dir.Value == null)
+                    {
+                        messages = null;
                         if (errors == 0)
                         {
                             var wait = new Semaphore(0, 1);
                             _testServer.OnTestResults.Subscribe(results =>
                             {
-                                testFailures = results.TestsFailed;
+                                testFailures = results.TestsFailed + results.SuitesFailed;
                                 testResults = results;
                                 wait.Release();
                             });
@@ -570,24 +579,22 @@ namespace Lib.Composition
                             _logger.Success("Build successful. Starting Chrome to run tests in " +
                                             durationb.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s");
 
-                            _testServer.StartTest("/test.html",
-                                new Dictionary<string, SourceMap> {{"testbundle.js", testBuildResult.SourceMap}},
-                                testCommand.SpecFilter.Value);
+                            _testServer.StartTest("/test.html", fastBundle.SourceMaps, testCommand.SpecFilter.Value);
                             StartChromeTest();
                             wait.WaitOne();
                             StopChromeTest();
                         }
                     }
+                }
 
-                    if (testCommand.Out.Value != null)
-                        File.WriteAllText(testCommand.Out.Value,
-                            testResults.ToJUnitXml(testCommand.FlatTestSuites.Value), new UTF8Encoding(false));
-                }
-                catch (Exception ex)
-                {
-                    _logger.Error("Fatal Error: " + ex);
-                    errors++;
-                }
+                if (testCommand.Out.Value != null)
+                    File.WriteAllText(testCommand.Out.Value,
+                        testResults.ToJUnitXml(testCommand.FlatTestSuites.Value), new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Fatal Error: " + ex);
+                errors++;
             }
 
             var duration = DateTime.UtcNow - start;
@@ -616,20 +623,21 @@ namespace Lib.Composition
             }
         }
 
-        void SaveFilesContentToDisk(Dictionary<string, object> filesContent, string dir)
+        void SaveFilesContentToDisk(RefDictionary<string, object> filesContent, string dir)
         {
             dir = PathUtils.Normalize(dir);
             var utf8WithoutBom = new UTF8Encoding(false);
-            foreach (var nameAndContent in filesContent)
+            foreach (var index in filesContent.Index)
             {
-                var content = nameAndContent.Value;
-                var fileName = PathUtils.Join(dir, nameAndContent.Key);
+                ref var content = ref filesContent.ValueRef(index);
+                var fileName = PathUtils.Join(dir, filesContent.KeyRef(index));
                 if (content is Lazy<object>)
                 {
                     content = ((Lazy<object>) content).Value;
                 }
 
-                Directory.CreateDirectory(PathUtils.Parent(fileName) ?? ".");
+                Directory.CreateDirectory(PathUtils.DirToCreateDirectory(PathUtils.Parent(fileName)));
+
                 if (content is string)
                 {
                     File.WriteAllText(fileName, (string) content, utf8WithoutBom);
@@ -638,6 +646,8 @@ namespace Lib.Composition
                 {
                     File.WriteAllBytes(fileName, (byte[]) content);
                 }
+
+                content = null;
             }
         }
 
@@ -645,53 +655,33 @@ namespace Lib.Composition
         {
             IfEnabledStartVerbosive();
             InitDiskCache();
-            var proj = AddProject(PathUtils.Normalize(Environment.CurrentDirectory), false);
+            _mainBuildResult = new MainBuildResult(false, null);
+            var proj = SetMainProject(PathUtils.Normalize(Environment.CurrentDirectory));
             _logger.WriteLine("Build started " + proj.Owner.Owner.FullPath, ConsoleColor.Cyan);
             try
             {
-                proj.Owner.LoadProjectJson(_forbiddenDependencyUpdate);
-                proj.Localize = false;
-                proj.Owner.InitializeOnce();
-                proj.Owner.UsedDependencies = new HashSet<string>();
+                proj.UpdateFromProjectJson(false);
+                var buildResult = new BuildResult(_mainBuildResult, proj);
                 proj.GenerateCode();
+                proj.RefreshCompilerOptions();
                 proj.RefreshMainFile();
                 proj.RefreshTestSources();
-                proj.SpriterInitialization();
-                proj.DetectBobrilJsxDts();
+                proj.SpriterInitialization(_mainBuildResult);
                 proj.RefreshExampleSources();
-                var ctx = new BuildCtx(_compilerPool, _verbose, ShowTsVersion);
-                ctx.TSCompilerOptions = proj.GetDefaultTSCompilerOptions();
-                ctx.Sources = new HashSet<string>();
-                ctx.Sources.Add(proj.MainFile);
-                proj.ExampleSources.ForEach(s => ctx.Sources.Add(s));
-                if (proj.BobrilJsxDts != null)
-                    ctx.Sources.Add(proj.BobrilJsxDts);
-                proj.Owner.Build(ctx);
-                var buildResult = ctx.BuildResult.Path2FileInfo.Values.ToHashSet();
-                if (proj.TestSources != null && proj.TestSources.Count > 0)
-                {
-                    ctx = new BuildCtx(_compilerPool, _verbose, ShowTsVersion);
-                    ctx.TSCompilerOptions = proj.GetDefaultTSCompilerOptions();
-                    ctx.Sources = new HashSet<string>();
-                    ctx.Sources.Add(proj.JasmineDts);
-                    proj.TestSources.ForEach(s => ctx.Sources.Add(s));
-                    if (proj.BobrilJsxDts != null)
-                        ctx.Sources.Add(proj.BobrilJsxDts);
-                    proj.Owner.Build(ctx);
-                    var testBuildResult = ctx.BuildResult;
-                    buildResult.UnionWith(testBuildResult.Path2FileInfo.Values);
-                }
+                var ctx = new BuildCtx(_compilerPool, _dc, _verbose, _logger, proj.Owner.Owner.FullPath);
+                ctx.Build(proj, true, buildResult, _mainBuildResult, 1);
+                var buildResultSet = buildResult.Path2FileInfo.Values.ToHashSet();
 
-                if (buildResult.Any(a => a.Diagnostic?.Any(d => d.isError) ?? false))
+                if (buildResultSet.Any(a => a.Diagnostics.Any(d => d.IsError)))
                 {
                     _logger.Error("Compiled with errors => result could be wrong.");
                     _logger.Warn("If you didn't installed modules run 'bb p i' before 'bb fu'.");
                 }
 
                 var unused = new List<string>();
-                SearchUnused(buildResult, proj.Owner.Owner, unused, "");
+                SearchUnused(buildResultSet.Select(i => i.Owner.FullPath).ToHashSet(), proj.Owner.Owner, unused, "");
                 _logger.WriteLine(
-                    "Build finished total used: " + buildResult.Count + " total unused: " + unused.Count,
+                    "Build finished total used: " + buildResultSet.Count + " total unused: " + unused.Count,
                     ConsoleColor.Cyan);
                 foreach (var name in unused)
                 {
@@ -704,7 +694,7 @@ namespace Lib.Composition
             }
         }
 
-        void SearchUnused(HashSet<TSFileAdditionalInfo> used, IDirectoryCache dir, List<string> unused, string prefix)
+        void SearchUnused(HashSet<string> used, IDirectoryCache dir, List<string> unused, string prefix)
         {
             foreach (var item in dir)
             {
@@ -717,11 +707,10 @@ namespace Lib.Composition
                 }
                 else if (item is IFileCache itemFile)
                 {
-                    if (itemFile.IsVirtual)
+                    var ext = PathUtils.GetExtension(itemFile.Name);
+                    if (ext != "ts" || ext != "tsx")
                         continue;
-                    if (PathUtils.GetExtension(itemFile.Name) != "ts")
-                        continue;
-                    if (used.Contains(itemFile.AdditionalInfo))
+                    if (used.Contains(itemFile.FullPath))
                         continue;
                     unused.Add(prefix + itemFile.Name);
                 }
@@ -750,11 +739,12 @@ namespace Lib.Composition
             }
 
             InitDiskCache(true);
+            _mainBuildResult = new MainBuildResult(false, command.VersionDir.Value);
             InitTestServer();
             InitMainServer();
-            AddProject(PathUtils.Normalize(Environment.CurrentDirectory), command.Sprite.Value);
+            SetMainProject(PathUtils.Normalize(Environment.CurrentDirectory)).SpriteGeneration = command.Sprite.Value;
             StartWebServer(port, command.BindToAny.Value);
-            InitInteractiveMode(command.VersionDir.Value, command.Localize.Value);
+            InitInteractiveMode(command.Localize.Value);
             WaitForStop();
         }
 
@@ -764,23 +754,28 @@ namespace Lib.Composition
             {
                 ContractResolver = new CamelCasePropertyNamesContractResolver()
             };
-            if (_inDocker)
+            _bbdir = Environment.GetEnvironmentVariable("BBCACHEDIR");
+            if (_bbdir == null)
             {
-                _bbdir = "/bbcache";
-            }
-            else
-            {
-                var location = new Uri(Assembly.GetEntryAssembly().GetName().CodeBase);
-                var runningFrom = PathUtils.Normalize(new FileInfo(location.AbsolutePath).Directory.FullName);
-                _bbdir = PathUtils.Join(
-                    PathUtils.Normalize(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)), ".bbcore");
-                if (runningFrom.StartsWith(_bbdir))
+                if (_inDocker)
                 {
-                    _bbdir = PathUtils.Join(_bbdir, "tools");
+                    _bbdir = "/bbcache";
                 }
                 else
                 {
-                    _bbdir = PathUtils.Join(_bbdir, "dev");
+                    var location = new Uri(Assembly.GetEntryAssembly().GetName().CodeBase);
+                    var runningFrom = PathUtils.Normalize(new FileInfo(location.AbsolutePath).Directory.FullName);
+                    _bbdir = PathUtils.Join(
+                        PathUtils.Normalize(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)),
+                        ".bbcore");
+                    if (runningFrom.StartsWith(_bbdir))
+                    {
+                        _bbdir = PathUtils.Join(_bbdir, "tools");
+                    }
+                    else
+                    {
+                        _bbdir = PathUtils.Join(_bbdir, "dev");
+                    }
                 }
             }
 
@@ -791,16 +786,35 @@ namespace Lib.Composition
 
         public void InitDiskCache(bool withWatcher = false)
         {
-            _dc = _inDocker || !withWatcher
-                ? new DiskCache.DiskCache(new NativeFsAbstraction(), () => new DummyWatcher())
-                : new DiskCache.DiskCache(new NativeFsAbstraction(), () => new OsWatcher());
+            Func<IDirectoryWatcher> watcherFactory = () => (IDirectoryWatcher) new DummyWatcher();
+            if (withWatcher)
+            {
+                if (Environment.GetEnvironmentVariable("BBWATCHER") is {} delayStr &&
+                    uint.TryParse(delayStr, out var delay))
+                {
+                    _logger.Info("Using watcher with " + delay + "ms polling");
+                    watcherFactory = () => new PollingWatcher(TimeSpan.FromMilliseconds(delay));
+                }
+                else if (_inDocker)
+                {
+                    delay = 250;
+                    _logger.Info("Using watcher with " + delay + "ms polling");
+                    watcherFactory = () => new PollingWatcher(TimeSpan.FromMilliseconds(delay));
+                }
+                else
+                {
+                    watcherFactory = () => new OsWatcher();
+                }
+            }
+
+            _dc = new DiskCache.DiskCache(new NativeFsAbstraction(), watcherFactory);
         }
 
-        public ProjectOptions AddProject(string path, bool enableSpritting)
+        public ProjectOptions SetMainProject(string path)
         {
             var projectDir = PathUtils.Normalize(new DirectoryInfo(path).FullName);
             var dirCache = _dc.TryGetItem(projectDir) as IDirectoryCache;
-            var proj = TSProject.Get(dirCache, _dc, _logger, null);
+            var proj = TSProject.Create(dirCache, _dc, _logger, null);
             proj.IsRootProject = true;
             if (proj.ProjectOptions.BuildCache != null)
                 return proj.ProjectOptions;
@@ -809,14 +823,8 @@ namespace Lib.Composition
                 Tools = _tools,
                 BuildCache = _buildCache,
                 Owner = proj,
-                Defines = new Dictionary<string, bool> {{"DEBUG", true}},
-                SpriteGeneration = enableSpritting
+                ForbiddenDependencyUpdate = _forbiddenDependencyUpdate
             };
-            lock (_projectsLock)
-            {
-                _projects.Add(proj.ProjectOptions);
-            }
-
             _currentProject = proj.ProjectOptions;
             if (_mainServer != null)
                 _mainServer.Project = _currentProject;
@@ -844,6 +852,11 @@ namespace Lib.Composition
 
         async Task Handler(HttpContext context)
         {
+            // In Google Chrome 75 running from Docker have in same cases problem with loading of resources.
+            // There was resources with pending status which is never resolved (but data was actually send by Kestrel
+            // server to Chrome client)
+            // Task.Delay(10) is workaround fix which should prevent Chrome pending status
+            await Task.Delay(10);
             var path = context.Request.Path;
             if (path == "/")
                 path = "/index.html";
@@ -888,6 +901,12 @@ namespace Lib.Composition
                 return;
             }
 
+            if (path == "/bb/api/getFileCoverage")
+            {
+                await HandleJsonApi<GetFileCoverageRequest, GetFileCoverageResponse>(context, GetFileCoverage);
+                return;
+            }
+
             if (path.StartsWithSegments("/bb/api/liveReload", out var liveIdx))
             {
                 while (_currentProject.LiveReloadIdx == int.Parse(liveIdx.Value.Substring(1)))
@@ -903,7 +922,7 @@ namespace Lib.Composition
 
             if (path.StartsWithSegments("/bb/base", out var src))
             {
-                var srcPath = PathUtils.Join(_currentProject.CommonSourceDirectory, src.Value.Substring(1));
+                var srcPath = PathUtils.Join(_mainBuildResult.CommonSourceDirectory, src.Value.Substring(1));
                 var srcFileCache = _dc.TryGetItem(srcPath) as IFileCache;
                 if (srcFileCache != null)
                 {
@@ -936,7 +955,7 @@ namespace Lib.Composition
             }
 
             var pathWithoutFirstSlash = path.Value.Substring(1);
-            var filesContentFromCurrentProjectBuildResult = _currentProject.FilesContent;
+            var filesContentFromCurrentProjectBuildResult = _mainBuildResult.FilesContent;
             object content;
             if (FindInFilesContent(pathWithoutFirstSlash, filesContentFromCurrentProjectBuildResult, out content))
             {
@@ -958,12 +977,270 @@ namespace Lib.Composition
                 return;
             }
 
-            context.Response.StatusCode = 404;
-            await context.Response.WriteAsync("Not found " + path);
+            var proxy = _mainBuildResult.ProxyUrl;
+            if (proxy != null)
+            {
+                if (context.WebSockets.IsWebSocketRequest)
+                {
+                    var wsproxy = new WebSocketProxyMiddleware(httpContext => Task.CompletedTask,
+                        new ProvideProxyOptions(), new Uri("ws" + proxy.Substring(4)),
+                        new NullLogger<WebSocketProxyMiddleware>());
+                    await wsproxy.Invoke(context);
+                }
+                else
+                {
+                    var httpproxy = new ProxyMiddleware<HandleProxyRequestWrapper>(null,
+                        new HandleProxyRequestWrapper(context =>
+                            context
+                                .ForwardTo(proxy)
+                                .AddXForwardedHeaders()
+                                .Send()));
+                    await httpproxy.Invoke(context);
+                }
+            }
+            else
+            {
+                context.Response.StatusCode = 404;
+                await context.Response.WriteAsync("Not found " + path);
+            }
+        }
+
+        static async Task HandleJsonApi<TReq, TResp>(HttpContext context, Func<TReq, TResp> func)
+        {
+            var reqBody = await new StreamReader(context.Request.Body, Encoding.UTF8).ReadToEndAsync();
+            var req = System.Text.Json.JsonSerializer.Deserialize<TReq>(reqBody,
+                new JsonSerializerOptions {PropertyNamingPolicy = JsonNamingPolicy.CamelCase});
+            var resp = func(req);
+            context.Response.ContentType = "application/json";
+            await System.Text.Json.JsonSerializer.SerializeAsync(context.Response.Body, resp,
+                new JsonSerializerOptions {PropertyNamingPolicy = JsonNamingPolicy.CamelCase});
+        }
+
+        GetFileCoverageResponse GetFileCoverage(GetFileCoverageRequest req)
+        {
+            var resp = new GetFileCoverageResponse();
+            resp.Status = "Unknown";
+            var wholeState = _testServer.GetState();
+            if (_mainBuildResult.CommonSourceDirectory == null)
+                return resp;
+            var fn = PathUtils.Subtract(PathUtils.Normalize(req.FileName), _mainBuildResult.CommonSourceDirectory!);
+            if (wholeState.Agents.Count == 0)
+                return resp;
+            if (!_currentProject.CoverageEnabled)
+                return resp;
+            var instr = _currentProject.CoverageInstrumentation;
+            if (instr == null)
+                return resp;
+            uint[]? coverageData = null;
+            foreach (var testResultsHolder in wholeState.Agents)
+            {
+                var ncd = testResultsHolder.CoverageData;
+                if (ncd == null) continue;
+                if (coverageData == null)
+                {
+                    coverageData = ncd.ToArray();
+                }
+                else if (coverageData.Length == ncd.Length)
+                {
+                    for (var i = 0; i < ncd.Length; i++)
+                    {
+                        coverageData[i] += ncd[i];
+                    }
+                }
+            }
+
+            if (coverageData == null)
+            {
+                resp.Status = "Calculating";
+                return resp;
+            }
+
+            resp.Ranges = new List<int>();
+            var r = resp.Ranges;
+
+            foreach (var statementInfo in instr.StatementInfos)
+            {
+                if (statementInfo.FileName != fn) continue;
+                RemoveOrSplitRange(r, statementInfo.Start, statementInfo.End);
+                r.Add(0);
+                r.Add(statementInfo.Start.Line);
+                r.Add(statementInfo.Start.Column);
+                r.Add(statementInfo.End.Line);
+                r.Add(statementInfo.End.Column);
+                r.Add((int) coverageData[statementInfo.Index]);
+            }
+
+            foreach (var conditionInfo in instr.ConditionInfos)
+            {
+                if (conditionInfo.FileName != fn) continue;
+                RemoveOrSplitRange(r, conditionInfo.Start, conditionInfo.End);
+                r.Add(1);
+                r.Add(conditionInfo.Start.Line);
+                r.Add(conditionInfo.Start.Column);
+                r.Add(conditionInfo.End.Line);
+                r.Add(conditionInfo.End.Column);
+                r.Add((int) coverageData[conditionInfo.Index]);
+                r.Add((int) coverageData[conditionInfo.Index + 1]);
+            }
+
+            resp.Status = "Done";
+            return resp;
+        }
+
+        struct Pos : IEquatable<Pos>
+        {
+            public Pos(int line, int col)
+            {
+                Line = line;
+                Col = col;
+            }
+
+            public Pos(Position pos)
+            {
+                Line = pos.Line;
+                Col = pos.Column;
+            }
+
+            public readonly int Line;
+            public readonly int Col;
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            ulong Key() => ((ulong) Line << 32) + (ulong) Col;
+
+            public bool Equals(Pos other)
+            {
+                return Line == other.Line && Col == other.Col;
+            }
+
+            public override bool Equals(object? obj)
+            {
+                return obj is Pos other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                return HashCode.Combine(Line, Col);
+            }
+
+            public static bool operator ==(Pos left, Pos right)
+            {
+                return left.Equals(right);
+            }
+
+            public static bool operator !=(Pos left, Pos right)
+            {
+                return !left.Equals(right);
+            }
+
+            public static bool operator <(Pos left, Pos right)
+            {
+                return left.Key() < right.Key();
+            }
+
+            public static bool operator >(Pos left, Pos right)
+            {
+                return left.Key() > right.Key();
+            }
+
+            public static bool operator <=(Pos left, Pos right)
+            {
+                return left.Key() <= right.Key();
+            }
+
+            public static bool operator >=(Pos left, Pos right)
+            {
+                return left.Key() >= right.Key();
+            }
+        }
+
+        void RemoveOrSplitRange(List<int> r, Position startPosition, Position endPosition)
+        {
+            var start = new Pos(startPosition);
+            var end = new Pos(endPosition);
+            for (var i = 0; i < r.Count;)
+            {
+                var cStart = new Pos(r[i + 1], r[i + 2]);
+                if (start <= cStart)
+                {
+                    i += CovCommandLen(r[i]);
+                    continue;
+                }
+                var cEnd = new Pos(r[i + 3], r[i + 4]);
+                if (end >= cEnd)
+                {
+                    i += CovCommandLen(r[i]);
+                    continue;
+                }
+                if (start == cStart)
+                {
+                    if (end == cEnd)
+                    {
+                        r.RemoveRange(i, CovCommandLen(r[i]));
+                        continue;
+                    }
+
+                    r[i + 1] = end.Line;
+                    r[i + 2] = end.Col;
+                }
+                else
+                {
+                    if (end == cEnd)
+                    {
+                        r[i + 3] = start.Line;
+                        r[i + 4] = start.Col;
+                    }
+                    else
+                    {
+                        r[i + 3] = start.Line;
+                        r[i + 4] = start.Col;
+                        r.Add(r[i]);
+                        r.Add(end.Line);
+                        r.Add(end.Col);
+                        r.Add(cEnd.Line);
+                        r.Add(cEnd.Col);
+                        r.AddRange(r.Skip(i + 5).Take(CovCommandLen(r[i]) - 5));
+                    }
+                }
+
+                i += CovCommandLen(r[i]);
+            }
+        }
+
+        static int CovCommandLen(int command)
+        {
+            return command == 0 ? 6 : 7;
+        }
+
+        class HandleProxyRequestWrapper : IProxyHandler
+        {
+            readonly HandleProxyRequest _handleProxyRequest;
+
+            public HandleProxyRequestWrapper(HandleProxyRequest handleProxyRequest)
+            {
+                _handleProxyRequest = handleProxyRequest;
+            }
+
+            public Task<HttpResponseMessage> HandleProxyRequest(HttpContext httpContext)
+                => _handleProxyRequest(httpContext);
+        }
+
+        class ProvideProxyOptions : IOptionsMonitor<ProxyOptions>
+        {
+            public ProxyOptions Get(string name)
+            {
+                return CurrentValue;
+            }
+
+            public IDisposable OnChange(Action<ProxyOptions, string> listener)
+            {
+                return null;
+            }
+
+            public ProxyOptions CurrentValue => new ProxyOptions();
         }
 
         static bool FindInFilesContent(string pathWithoutFirstSlash,
-            Dictionary<string, object> filesContentFromCurrentProjectBuildResult, out object content)
+            RefDictionary<string, object> filesContentFromCurrentProjectBuildResult, out object content)
         {
             content = null;
             if (filesContentFromCurrentProjectBuildResult == null)
@@ -985,18 +1262,22 @@ namespace Lib.Composition
 
         public void InitTestServer(bool notify = true)
         {
-            _testServer = new TestServer(_verbose);
+            _testServer = new TestServer(_verbose, _logger);
             _testServerLongPollingHandler = new LongPollingServer(_testServer.NewConnectionHandler);
             if (notify)
             {
                 _testServer.OnTestResults.Subscribe((results) =>
                 {
-                    var color = results.TestsFailed != 0 ? ConsoleColor.Red :
+                    var color = (results.TestsFailed + results.SuitesFailed) != 0 ? ConsoleColor.Red :
                         results.TestsSkipped != 0 ? ConsoleColor.Yellow : ConsoleColor.Green;
                     _logger.WriteLine(
-                        $"Tests on {results.UserAgent} Failed: {results.TestsFailed} Skipped: {results.TestsSkipped} Total: {results.TotalTests} Duration: {results.Duration * 0.001:F1}s",
+                        $"Tests on {results.UserAgent} Failed: {results.TestsFailed}+{results.SuitesFailed} Skipped: {results.TestsSkipped} Total: {results.TotalTests} Duration: {results.Duration * 0.001:F1}s",
                         color);
                     _notificationManager.SendNotification(results.ToNotificationParameters());
+                });
+                _testServer.OnCoverageResults.Subscribe((results) =>
+                {
+                    _logger.Info($"Coverage from {results.UserAgent} received");
                 });
             }
         }
@@ -1004,146 +1285,115 @@ namespace Lib.Composition
         public void InitMainServer()
         {
             _mainServer = new MainServer(() => _testServer.GetState());
+            _mainServer.MainBuildResult = _mainBuildResult;
             _mainServerLongPollingHandler = new LongPollingServer(_mainServer.NewConnectionHandler);
-            _testServer.OnChange.Subscribe((_) => { _mainServer.NotifyTestServerChange(); });
+            _testServer.OnChange.Subscribe(_ => { _mainServer.NotifyTestServerChange(); });
+            _testServer.OnCoverageResults.Subscribe(_ => { _mainServer.NotifyCoverageChange(); });
         }
 
-        public void InitInteractiveMode(string versionDir, bool? localizeValue)
+        public void InitInteractiveMode(bool? localizeValue)
         {
             _hasBuildWork.Set();
-            _dc.ChangeObservable.Throttle(TimeSpan.FromMilliseconds(200)).Subscribe((_) => _hasBuildWork.Set());
+            var throttled = _dc.ChangeObservable.Throttle(TimeSpan.FromMilliseconds(200));
+            throttled.Merge(throttled.Delay(TimeSpan.FromMilliseconds(300))).Subscribe((_) => _hasBuildWork.Set());
+            var iterationId = 0;
+            var ctx = new BuildCtx(_compilerPool, _dc, _verbose, _logger, _currentProject.Owner.Owner.FullPath);
+            var buildResult = new BuildResult(_mainBuildResult, _currentProject);
+            var fastBundle = new FastBundleBundler(_tools, _mainBuildResult, _currentProject, buildResult);
+            var start = DateTime.UtcNow;
+            int errors = 0;
+            int warnings = 0;
+            var messages = new List<Diagnostic>();
+
             Task.Run(() =>
             {
                 while (_hasBuildWork.WaitOne())
                 {
-                    if (!_dc.CheckForTrueChange())
+                    if (iterationId != 0 && !_dc.CheckForTrueChange())
                         continue;
                     _dc.ResetChange();
                     _hasBuildWork.Set();
-                    var start = DateTime.UtcNow;
-                    ProjectOptions[] toBuild;
-                    lock (_projectsLock)
-                    {
-                        toBuild = _projects.ToArray();
-                    }
-
-                    if (toBuild.Length == 0)
-                    {
-                        _logger.Error("Change detected, but no project to build");
-                        continue;
-                    }
-
+                    start = DateTime.UtcNow;
+                    iterationId++;
                     _mainServer.NotifyCompilationStarted();
-                    int errors = 0;
-                    int warnings = 0;
-                    var messages = new List<CompilationResultMessage>();
-                    var messagesFromFiles = new HashSet<string>();
-                    var totalFiles = 0;
-                    foreach (var proj in toBuild)
+                    errors = 0;
+                    warnings = 0;
+                    messages.Clear();
+                    var proj = _currentProject;
+                    _logger.WriteLine("Build started " + proj.Owner.Owner.FullPath, ConsoleColor.Cyan);
+                    try
                     {
-                        _logger.WriteLine("Build started " + proj.Owner.Owner.FullPath, ConsoleColor.Cyan);
-                        try
+                        proj.UpdateFromProjectJson(localizeValue);
+                        _mainBuildResult.ProxyUrl = proj.ProxyUrl;
+                        proj.GenerateCode();
+                        proj.RefreshCompilerOptions();
+                        proj.RefreshMainFile();
+                        proj.RefreshTestSources();
+                        proj.RefreshExampleSources();
+                        proj.SpriterInitialization(_mainBuildResult);
+                        ctx.Build(proj, false, buildResult, _mainBuildResult, iterationId);
+                        ctx.BuildSubProjects(proj, false, buildResult, _mainBuildResult, iterationId);
+                        proj.UpdateTSConfigJson();
+                        if (!buildResult.HasError)
                         {
-                            proj.Owner.LoadProjectJson(_forbiddenDependencyUpdate);
-                            if (localizeValue != null)
-                                proj.Localize = localizeValue ?? false;
-                            proj.Owner.InitializeOnce();
-                            proj.OutputSubDir = versionDir;
-                            proj.Owner.UsedDependencies = new HashSet<string>();
-                            proj.GenerateCode();
-                            proj.RefreshMainFile();
-                            proj.RefreshTestSources();
-                            proj.SpriterInitialization();
-                            proj.DetectBobrilJsxDts();
-                            proj.RefreshExampleSources();
-                            proj.UpdateTSConfigJson();
-                            var ctx = new BuildCtx(_compilerPool, _verbose, ShowTsVersion);
-                            ctx.TSCompilerOptions = proj.GetDefaultTSCompilerOptions();
-                            ctx.Sources = new HashSet<string>();
-                            ctx.Sources.Add(proj.MainFile);
-                            proj.ExampleSources.ForEach(s => ctx.Sources.Add(s));
-                            if (proj.BobrilJsxDts != null)
-                                ctx.Sources.Add(proj.BobrilJsxDts);
-                            proj.Owner.Build(ctx);
-                            var buildResult = ctx.BuildResult;
-                            var filesContent = new Dictionary<string, object>();
-                            proj.FillOutputByAdditionalResourcesDirectory(filesContent, buildResult.Modules);
-                            var fastBundle = new FastBundleBundler(_tools);
-                            fastBundle.FilesContent = filesContent;
-                            fastBundle.Project = proj;
-                            fastBundle.BuildResult = buildResult;
-                            fastBundle.Build("bb/base", "bundle.js.map");
-                            proj.MainProjFastBundle = fastBundle;
-                            IncludeMessages(proj, proj.MainProjFastBundle, ref errors, ref warnings, messages,
-                                messagesFromFiles, proj.Owner.Owner.FullPath);
-                            if (errors == 0 && proj.LiveReloadEnabled)
-                            {
-                                proj.LiveReloadIdx++;
-                                proj.LiveReloadAwaiter.TrySetResult(Unit.Default);
-                            }
-
-                            if (proj.TestSources != null && proj.TestSources.Count > 0)
-                            {
-                                ctx = new BuildCtx(_compilerPool, _verbose, ShowTsVersion);
-                                ctx.TSCompilerOptions = proj.GetDefaultTSCompilerOptions();
-                                ctx.Sources = new HashSet<string>();
-                                ctx.Sources.Add(proj.JasmineDts);
-                                proj.TestSources.ForEach(s => ctx.Sources.Add(s));
-                                if (proj.BobrilJsxDts != null)
-                                    ctx.Sources.Add(proj.BobrilJsxDts);
-                                proj.Owner.Build(ctx);
-                                var testBuildResult = ctx.BuildResult;
-                                fastBundle = new FastBundleBundler(_tools);
-                                fastBundle.FilesContent = filesContent;
-                                fastBundle.Project = proj;
-                                fastBundle.BuildResult = testBuildResult;
-                                fastBundle.Build("bb/base", "testbundle.js.map", true);
-                                proj.TestProjFastBundle = fastBundle;
-                                IncludeMessages(proj, proj.TestProjFastBundle, ref errors, ref warnings, messages,
-                                    messagesFromFiles, proj.Owner.Owner.FullPath);
-                                if (errors == 0)
-                                {
-                                    _testServer.StartTest("/test.html",
-                                        new Dictionary<string, SourceMap>
-                                            {{"testbundle.js", testBuildResult.SourceMap}});
-                                    StartChromeTest();
-                                }
-                            }
-                            else
-                            {
-                                proj.TestProjFastBundle = null;
-                            }
-
-                            proj.FilesContent = filesContent;
-                            totalFiles += filesContent.Count;
-                            var unusedDeps = proj.Owner.Dependencies.ToHashSet();
-                            unusedDeps.ExceptWith(proj.Owner.UsedDependencies);
-                            AddUnusedDependenciesMessages(proj, unusedDeps, ref errors, ref warnings, messages);
+                            proj.FillOutputByAdditionalResourcesDirectory(buildResult.Modules, _mainBuildResult);
+                            fastBundle.Build("bb/base");
+                            fastBundle.BuildHtml();
                         }
-                        catch (Exception ex)
+
+                        IncludeMessages(proj, buildResult, ref errors, ref warnings, messages);
+                        buildResult.TaskForSemanticCheck.ContinueWith(semanticDiag =>
                         {
-                            _logger.Error("Fatal Error: " + ex);
-                            errors++;
+                            var duration = (DateTime.UtcNow - start).TotalSeconds;
+                            var allmess = IncludeSemanticMessages(_currentProject, semanticDiag.Result, ref errors,
+                                ref warnings,
+                                messages);
+                            _mainServer.NotifyCompilationFinished(errors, warnings, duration, allmess);
+                            _notificationManager.SendNotification(
+                                NotificationParameters.CreateBuildParameters(errors, warnings, duration));
+                            if (!buildResult.HasError) PrintMessages(allmess, true);
+                            var color = errors != 0 ? ConsoleColor.Red :
+                                warnings != 0 ? ConsoleColor.Yellow : ConsoleColor.Green;
+                            _logger.WriteLine(
+                                $"Semantic check done in {duration.ToString("F1", CultureInfo.InvariantCulture)}s with {Plural(errors, "error")} and {Plural(warnings, "warning")}",
+                                color);
+                        }, TaskContinuationOptions.OnlyOnRanToCompletion);
+                        if (errors == 0 && proj.LiveReloadEnabled)
+                        {
+                            proj.LiveReloadIdx++;
+                            proj.LiveReloadAwaiter.TrySetResult(Unit.Default);
+                        }
+
+                        if (proj.TestSources != null && proj.TestSources.Count > 0)
+                        {
+                            if (errors == 0)
+                            {
+                                fastBundle.BuildHtml(true);
+                                _testServer.StartTest("/test.html", fastBundle.SourceMaps);
+                                StartChromeTest();
+                            }
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        _logger.Error("Fatal Error: " + ex);
+                        errors++;
+                    }
 
-                    var duration = DateTime.UtcNow - start;
-                    _mainServer.NotifyCompilationFinished(errors, warnings, duration.TotalSeconds, messages);
-                    _notificationManager.SendNotification(
-                        NotificationParameters.CreateBuildParameters(errors, warnings, duration.TotalSeconds));
+                    var duration = (DateTime.UtcNow - start).TotalSeconds;
+                    _mainServer.NotifyCompilationFinished(errors, warnings, duration, messages);
                     PrintMessages(messages);
                     var color = errors != 0 ? ConsoleColor.Red :
                         warnings != 0 ? ConsoleColor.Yellow : ConsoleColor.Green;
                     _logger.WriteLine(
-                        $"Build done in {(DateTime.UtcNow - start).TotalSeconds.ToString("F1", CultureInfo.InvariantCulture)}s with {Plural(errors, "error")} and {Plural(warnings, "warning")} and has {Plural(totalFiles, "file")}",
+                        $"Build done in {duration.ToString("F1", CultureInfo.InvariantCulture)}s with {Plural(errors, "error")} and {Plural(warnings, "warning")} and has {Plural(_mainBuildResult.FilesContent.Count, "file")}",
                         color);
-                    _dc.ResetChange();
                 }
             });
         }
 
         void AddUnusedDependenciesMessages(ProjectOptions options, HashSet<string> unusedDeps, ref int errors,
-            ref int warnings, List<CompilationResultMessage> messages)
+            ref int warnings, List<Diagnostic> messages)
         {
             foreach (var unusedDep in unusedDeps)
             {
@@ -1160,19 +1410,12 @@ namespace Lib.Composition
                     errors++;
                 else
                     warnings++;
-                messages.Add(new CompilationResultMessage
+                messages.Add(new Diagnostic
                 {
                     FileName = "package.json",
                     IsError = isError,
                     Text = "Unused dependency " + unusedDep + " in package.json",
-                    Code = unusedDependencyCode,
-                    Pos = new[]
-                    {
-                        1,
-                        1,
-                        1,
-                        1
-                    }
+                    Code = unusedDependencyCode
                 });
             }
         }
@@ -1184,75 +1427,84 @@ namespace Lib.Composition
             return $"{number} {word}{(number > 1 ? "s" : "")}";
         }
 
-        void IncludeMessages(ProjectOptions options, FastBundleBundler fastBundle, ref int errors, ref int warnings,
-            List<CompilationResultMessage> messages, HashSet<string> messagesFromFiles, string rootPath)
-        {
-            IncludeMessages(options, fastBundle.BuildResult, ref errors, ref warnings, messages, messagesFromFiles,
-                rootPath);
-        }
-
         void IncludeMessages(ProjectOptions options, BuildResult buildResult, ref int errors, ref int warnings,
-            List<CompilationResultMessage> messages, HashSet<string> messagesFromFiles, string rootPath)
+            List<Diagnostic> messages)
         {
-            var usedDependencies = options.Owner.UsedDependencies;
+            var rootPath = options.Owner.Owner.FullPath;
             foreach (var pathInfoPair in buildResult.Path2FileInfo)
             {
-                if (messagesFromFiles.Contains(pathInfoPair.Key))
-                    continue;
-                if (usedDependencies != null && options.Owner == pathInfoPair.Value.MyProject)
-                {
-                    if (pathInfoPair.Value.ModuleImports != null)
-                    {
-                        foreach (var moduleImport in pathInfoPair.Value.ModuleImports)
-                        {
-                            usedDependencies.Add(moduleImport.Name);
-                        }
-                    }
-
-                    var assets = pathInfoPair.Value.SourceInfo?.assets;
-                    if (assets != null)
-                    {
-                        foreach (var asset in assets)
-                        {
-                            if (buildResult.Path2FileInfo.TryGetValue(asset.name, out var info))
-                            {
-                                var module = info.GetFromModule();
-                                if (module != null)
-                                    usedDependencies.Add(module);
-                            }
-                        }
-                    }
-                }
-
-                messagesFromFiles.Add(pathInfoPair.Key);
-                var diag = pathInfoPair.Value.Diagnostic;
-                if (diag == null)
-                    continue;
+                var diag = pathInfoPair.Value.Diagnostics;
                 foreach (var d in diag)
                 {
-                    if (options.IgnoreDiagnostic?.Contains(d.code) ?? false)
+                    if (options.IgnoreDiagnostic?.Contains(d.Code) ?? false)
                         continue;
-                    var isError = d.isError || options.WarningsAsErrors;
+                    var isError = d.IsError || options.WarningsAsErrors;
                     if (isError)
                         errors++;
                     else
                         warnings++;
-                    messages.Add(new CompilationResultMessage
+                    messages.Add(new Diagnostic
                     {
-                        FileName = PathUtils.Subtract(pathInfoPair.Key, rootPath),
+                        FileName = PathUtils.ForDiagnosticDisplay(pathInfoPair.Key,
+                            _mainBuildResult.CommonSourceDirectory ?? rootPath, _mainBuildResult.CommonSourceDirectory),
                         IsError = isError,
-                        Text = d.text,
-                        Code = d.code,
-                        Pos = new[]
-                        {
-                            d.startLine + 1,
-                            d.startCharacter + 1,
-                            d.endLine + 1,
-                            d.endCharacter + 1
-                        }
+                        Text = d.Text,
+                        Code = d.Code,
+                        StartLine = d.StartLine,
+                        StartCol = d.StartCol,
+                        EndLine = d.EndLine,
+                        EndCol = d.EndCol
                     });
                 }
             }
+
+            if (buildResult.SubBuildResults != null)
+            {
+                foreach (var subBuildResult in buildResult.SubBuildResults)
+                {
+                    IncludeMessages(options, subBuildResult.Value, ref errors, ref warnings, messages);
+                }
+            }
+        }
+
+        List<Diagnostic> IncludeSemanticMessages(ProjectOptions options, List<Diagnostic>? semanticDiagnostics,
+            ref int errors,
+            ref int warnings,
+            List<Diagnostic> messages)
+        {
+            if (semanticDiagnostics == null || semanticDiagnostics.Count == 0) return messages;
+            var res = messages.ToList();
+            var rootPath = options.Owner.Owner.FullPath;
+            foreach (var d in semanticDiagnostics)
+            {
+                if (options.IgnoreDiagnostic?.Contains(d.Code) ?? false)
+                    continue;
+                var isError = d.IsError || options.WarningsAsErrors;
+                var dd = new Diagnostic
+                {
+                    FileName = PathUtils.ForDiagnosticDisplay(d.FileName,
+                        _mainBuildResult.CommonSourceDirectory ?? rootPath,
+                        _mainBuildResult.CommonSourceDirectory),
+                    IsError = isError,
+                    Text = d.Text,
+                    Code = d.Code,
+                    StartLine = d.StartLine,
+                    StartCol = d.StartCol,
+                    EndLine = d.EndLine,
+                    EndCol = d.EndCol
+                };
+                if (!res.Contains(dd))
+                {
+                    dd.IsSemantic = true;
+                    res.Add(dd);
+                    if (isError)
+                        errors++;
+                    else
+                        warnings++;
+                }
+            }
+
+            return res;
         }
 
         public void StartChromeTest()
@@ -1263,6 +1515,16 @@ namespace Lib.Composition
                 _chromeProcessFactory = new ChromeProcessFactory(_inDocker, chromePath);
             }
 
+            if (_chromeProcess != null)
+            {
+                var state = _testServer.GetState();
+                if (!state.Agents.Exists(a => a.UserAgent.Contains("Headless")))
+                {
+                    _logger.Warn("Headless chrome not responding - restarting");
+                    _chromeProcess.Dispose();
+                    _chromeProcess = null;
+                }
+            }
             if (_chromeProcess == null)
             {
                 try
@@ -1288,7 +1550,7 @@ namespace Lib.Composition
 
         public void WaitForStop()
         {
-            Console.CancelKeyPress += (object sender, ConsoleCancelEventArgs args) =>
+            Console.CancelKeyPress += (sender, args) =>
             {
                 ExitWithCleanUp();
                 args.Cancel = true;

@@ -26,6 +26,10 @@ In `package.json` create `bobril` section and set `bbVersion` to specific versio
 
 By setting `BBVERSION` enviroment variable you can define default version (including prerelease). If you will start `bb2` instead of `bb`, then `BBVERSION` override what is in `package.json`
 
+# How to override where bb store its caches
+
+bb stores its cache in `user_home/.bbcache` directory. In Docker it uses `/bbcache`. You can override it be defining `BBCACHEDIR` environmental variable.
+
 # How to use Docker version
 
 ## Run it
@@ -63,13 +67,65 @@ By setting `BBVERSION` enviroment variable you can define default version (inclu
 | -7     | Warn     | Problem with translation message                                                               |
 | -8     | Error    | Translation message must be compile time resolvable constant string, use f instead if intended |
 | -9     | Error    | Hint message must be compile time resolvable constant string                                   |
-| -10    | Error    | Absolute import name must be just simple module name                                           |
 | -11    | Warn     | Fixing local import with two slashes                                                           |
 | -12    | Warn     | Importing module without being in package.json as dependency                                   |
 | -13    | Warn     | Unused dependency in package.json                                                              |
 | -14    | Warn     | Importing obsolete module: reason                                                              |
+| -15    | Warn     | Cannot resolve import                                                                          |
 
 # Package.json - bobril section features
+
+## Define global contants and process.env
+
+global constants are defined using "defines" object. If `DEBUG` is not defined is it automatically defined as `DEBUG` build-in constant which is true in interactive, test modes and fast build mode. First are expanded all `defines`, than result of this expansion is input to `envs` expansion. In `envs` you define replacement for `process.env` object. If `NODE_ENV` is not defined is it automatically defined like in example below.
+
+```JSON
+"defines": {
+    "DEBUG": "DEBUG"
+},
+"envs": {
+    "NODE_ENV": "DEBUG?\"development\":\"production\"",
+    "path": "env.Path"
+}
+```
+
+## Update of tsconfig.json
+
+Build generates tsconfig.json by default. You can disable this feature by:
+
+    "bobril": {
+        "tsconfigUpdate": false
+    }
+
+## Override localization
+
+By default localization is detected from existence of dependency bobril-g11n. You can override it:
+
+    "bobril": {
+        "localize": true
+    }
+
+## Override directory with translations
+
+    "bobril": {
+        "pathToTranslations": "translations/path/like/this"
+    }
+
+It is relative to project. Default is "translations".
+
+## Define default build path
+
+    "bobril": {
+        "buildOutputDir": "./dist"
+    }
+
+## Where to find test sources
+
+By default it finds all tests in project directory (it always skips `node_modules`). By defining this, you can limit or add additional directories where to search.
+
+    "bobril": {
+        "testDirectories": [ "spec" ]
+    }
 
 ## Warnings As Errors
 
@@ -111,8 +167,32 @@ Use this comment in source code with import to ignore this specific import (must
         }
     }
 
+## How to disable autodetection of common project root
+
+    "bobril": {
+        "preserveProjectRoot": true
+    }
+
+## Proxy all requests in interactive mode to defined url
+
+Useful if your API server does not uses CORS, so proxy requests through bobril-build localhost:8080. It includes support for WebSockets connections. Url have to start with `http://` or `https://`.
+
+    "bobril": {
+        "proxyUrl": "http://localhost:3001"
+    }
+
 # Environmental variables
+
+## Forcing Polling watcher
+
+Watcher inside Docker cannot use OS notification of filesystem changes. So by default BB inside docker uses polling implementation with 250ms check frequency. You modify this time in milliseconds by `BBWATCHER` variable, also without Docker it forces polling watcher:
+
+    set BBWATCHER=1000
 
 ## Disable yarn creating links
 
 Docker on Windows filesystem has limitation in creating links. To workaround this issue create environment variable `BBCoreNoLinks` with not empty value so bbcore will add `--no-bin-links` parameter to yarn command line.
+
+## Recognize when running in Docker
+
+It uses same variable like all other dotnet containers `DOTNET_RUNNING_IN_CONTAINER`.

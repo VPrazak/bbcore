@@ -47,10 +47,15 @@ namespace Lib.Composition
                 return new List<string> { urlLike };
             }
             var parts = ParseLocationRegexPar.Match(urlLike.Replace("()", ""));
+
             if (parts.Success)
-                return new List<string> { parts.Groups.ElementAtOrDefault(1)?.Value, parts.Groups.ElementAtOrDefault(2)?.Value, parts.Groups.ElementAtOrDefault(3)?.Value };
+            {
+                var gg = (IReadOnlyList<Group>)parts.Groups;
+                return new List<string> { gg.ElementAtOrDefault(1)?.Value, gg.ElementAtOrDefault(2)?.Value, gg.ElementAtOrDefault(3)?.Value };
+            }
             parts = ParseLocationRegex.Match(urlLike.Replace("()", ""));
-            return new List<string> { parts.Groups.ElementAtOrDefault(1)?.Value, parts.Groups.ElementAtOrDefault(2)?.Value, parts.Groups.ElementAtOrDefault(3)?.Value };
+            var g = (IReadOnlyList<Group>)parts.Groups;
+            return new List<string> { g.ElementAtOrDefault(1)?.Value, g.ElementAtOrDefault(2)?.Value, g.ElementAtOrDefault(3)?.Value };
         }
 
         static List<StackFrame> ParseV8OrIE(string stack)
@@ -100,20 +105,18 @@ namespace Lib.Composition
                     // Safari eval frames only have function names and nothing else
                     return new StackFrame() { FunctionName = line, Args = new List<string>() };
                 }
-                else
+
+                var tokens = line.Split('@');
+                var locationParts = ExtractLocation(tokens.Last());
+                var functionName = string.Join('@', tokens.SkipLast(1));
+                return new StackFrame
                 {
-                    var tokens = line.Split('@');
-                    var locationParts = ExtractLocation(tokens.Last());
-                    var functionName = string.Join('@', tokens.SkipLast(1));
-                    return new StackFrame
-                    {
-                        FunctionName = functionName,
-                        Args = new List<string>(),
-                        FileName = locationParts.ElementAtOrDefault(0),
-                        LineNumber = int.Parse(locationParts.ElementAtOrDefault(1) ?? "0"),
-                        ColumnNumber = int.Parse(locationParts.ElementAtOrDefault(2) ?? "0")
-                    };
-                }
+                    FunctionName = functionName,
+                    Args = new List<string>(),
+                    FileName = locationParts.ElementAtOrDefault(0),
+                    LineNumber = int.Parse(locationParts.ElementAtOrDefault(1) ?? "0"),
+                    ColumnNumber = int.Parse(locationParts.ElementAtOrDefault(2) ?? "0")
+                };
             }).ToList();
         }
 

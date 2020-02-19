@@ -10,7 +10,7 @@ namespace Lib.Composition
 {
     public class CompilerPool : ICompilerPool
     {
-        public CompilerPool(IToolsDir toolsDir, ILogger logger, int parallelCompilations = 1)
+        public CompilerPool(IToolsDir toolsDir, ILogger logger, int parallelCompilations = 20)
         {
             _toolsDir = toolsDir;
             _logger = logger;
@@ -26,14 +26,16 @@ namespace Lib.Composition
 
         readonly IToolsDir _toolsDir;
         readonly ILogger _logger;
-        private readonly int _parallelCompilations;
+        readonly int _parallelCompilations;
 
-        public ITSCompiler GetTs()
+        public ITSCompiler GetTs(DiskCache.IDiskCache diskCache, ITSCompilerOptions compilerOptions)
         {
             _semaphore.Wait();
-            if (_pool.TryTake(out var res))
-                return res;
-            return new TsCompiler(_toolsDir, _logger);
+            if (!_pool.TryTake(out var res))
+                res = new TsCompiler(_toolsDir, _logger);
+            res.DiskCache = diskCache;
+            if (compilerOptions != null) res.CompilerOptions = compilerOptions;
+            return res;
         }
 
         public void ReleaseTs(ITSCompiler value)

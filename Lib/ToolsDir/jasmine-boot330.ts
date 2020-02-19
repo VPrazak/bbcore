@@ -9,16 +9,6 @@ declare var jasmineRequire: any;
     var jasmineInterface = jasmineRequire.interface(jasmine, env);
     for (var property in jasmineInterface) (<any>window)[property] = jasmineInterface[property];
 
-    var specFilterRegExp = new RegExp((<any>window.parent).specFilter);
-    var config = {
-        failFast: true,
-        oneFailurePerSpec: true,
-        hideDisabled: false,
-        specFilter: function(spec: any) {
-            return specFilterRegExp.test(spec.getFullName());
-        }
-    };
-
     function _inspect(arg: any, within?: boolean): string {
         var result = "";
 
@@ -199,6 +189,8 @@ declare var jasmineRequire: any;
         return result + arr_obj.join(", ") + "\n" + repeatString(_indent, stack_length - 1) + "}";
     }
 
+    let testId = window.location.hash;
+
     function realLog(message: string) {
         let stack: string;
         let err = <any>new Error();
@@ -210,12 +202,26 @@ declare var jasmineRequire: any;
                 stack = err.stack || err.stacktrace;
             }
         }
-        bbTest("consoleLog", { message, stack });
+        bbTest("consoleLog" + testId, { message, stack });
     }
 
     var bbTest = (<any>window.parent).bbTest;
     if (bbTest) {
-        config.failFast = false;
+        var specFilter = (<any>window.parent).specFilter;
+        var specFilterFnc = (_spec: any) => true;
+        if (specFilter) {
+            var specFilterRegExp = new RegExp(specFilter);
+            specFilterFnc = (spec: any) => specFilterRegExp.test(spec.getFullName());
+        }
+        var config = {
+            failFast: false,
+            oneFailurePerSpec: true,
+            hideDisabled: false,
+            specFilter: specFilterFnc
+        };
+        onerror = ((msg: string, _url: string, _lineNo: number, _columnNo: number, error: Error) => {
+            bbTest("onerror" + testId, { message: msg, stack: error.stack });
+        }) as any;
         env.configure(config);
         var perfnow: () => number;
         if (window.performance) {
@@ -236,18 +242,41 @@ declare var jasmineRequire: any;
         let totalStart = 0;
         env.addReporter({
             jasmineStarted: (suiteInfo: { totalSpecsDefined: number }) => {
-                bbTest("wholeStart", suiteInfo.totalSpecsDefined);
+                bbTest("wholeStart" + testId, suiteInfo.totalSpecsDefined);
                 totalStart = perfnow();
             },
             jasmineDone: () => {
-                bbTest("wholeDone", perfnow() - totalStart);
+                bbTest("wholeDone" + testId, perfnow() - totalStart);
+                var cov = (window as any).__c0v as Uint32Array;
+                if (cov != undefined) {
+                    let pos = 0;
+                    const sendPart = () => {
+                        while (pos < cov.length && cov[pos] === 0) pos++;
+                        if (pos < cov.length) {
+                            let maxlen = Math.min(cov.length - pos, 1024);
+                            let len = maxlen - 1;
+                            while (cov[pos + len] === 0) len--;
+                            len++;
+                            bbTest("coverageReportPart" + testId, {
+                                start: pos,
+                                data: Array.prototype.slice.call(cov.slice(pos, pos + len))
+                            });
+                            pos += maxlen;
+                            setTimeout(sendPart, 10);
+                        } else {
+                            bbTest("coverageReportFinished" + testId, { length: cov.length });
+                        }
+                    };
+                    bbTest("coverageReportStarted" + testId, { length: cov.length });
+                    setTimeout(sendPart, 10);
+                }
             },
             suiteStarted: (result: { description: string; fullName: string }) => {
-                bbTest("suiteStart", result.description);
+                bbTest("suiteStart" + testId, result.description);
                 stack.push(perfnow());
             },
             specStarted: (result: { description: string; stack: string }) => {
-                bbTest("testStart", { name: result.description, stack: result.stack });
+                bbTest("testStart" + testId, { name: result.description, stack: result.stack });
                 specStart = perfnow();
             },
             specDone: (result: {
@@ -256,7 +285,7 @@ declare var jasmineRequire: any;
                 failedExpectations: { message: string; stack: string }[];
             }) => {
                 let duration = perfnow() - specStart;
-                bbTest("testDone", {
+                bbTest("testDone" + testId, {
                     name: result.description,
                     duration,
                     status: result.status,
@@ -269,7 +298,7 @@ declare var jasmineRequire: any;
                 failedExpectations: { message: string; stack: string }[];
             }) => {
                 let duration = perfnow() - stack.pop()!;
-                bbTest("suiteDone", {
+                bbTest("suiteDone" + testId, {
                     name: result.description,
                     duration,
                     status: result.status,
@@ -366,7 +395,12 @@ declare var jasmineRequire: any;
             _timers[name].end = end;
         };
     } else {
-        config.failFast = true;
+        var config = {
+            failFast: true,
+            oneFailurePerSpec: true,
+            hideDisabled: false,
+            specFilter: (_spec: any) => true
+        };
         env.configure(config);
 
         env.addReporter({
